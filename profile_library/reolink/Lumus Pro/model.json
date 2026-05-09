@@ -1,0 +1,31 @@
+{
+  "calculation_strategy": "fixed",
+  "compatible_integrations": [
+    "reolink"
+  ],
+  "created_at": "2026-05-09T20:00:00Z",
+  "device_type": "camera",
+  "measure_description": "Manually measured",
+  "measure_device": "TP-Link P110",
+  "measure_method": "manual",
+  "name": "Smart 4K 8MP Wi-Fi Security Camera",
+  "sub_profile_select": {
+    "matchers": [
+      {
+        "type": "entity_state",
+        "entity_id": "sensor.{{source_object_id}}_day_night_state",
+        "map": {
+          "day": "default",
+          "night": "night",
+          "led_day": "led_day"
+        }
+      }
+    ]
+  },
+  "author": "Amit Keret <amitkeretwork@gmail.com>",
+  "author_info": {
+    "name": "Amit Keret",
+    "email": "amitkeretwork@gmail.com",
+    "github": "amitkeret"
+  }
+}
