@@ -15,7 +15,7 @@
         "type": "entity_state",
         "entity_id": "sensor.{{source_object_id}}_day_night_state",
         "map": {
-          "day": "default",
+          "day": "day",
           "night": "night",
           "led_day": "led_day"
         }
