@@ -8,18 +8,18 @@ from custom_components.powercalc.config_flow import Step
 from custom_components.powercalc.const import (
     CONF_MANUFACTURER,
 )
+from tests.common import mock_device_with_entities
 from tests.config_flow.common import confirm_auto_discovered_model, select_menu_item
-from tests.conftest import MockEntityWithModel
 
 
 async def test_lightify_plug_selectable(
     hass: HomeAssistant,
-    mock_entity_with_model_information: MockEntityWithModel,
 ) -> None:
     """
     See https://github.com/bramstroker/homeassistant-powercalc/issues/2858
     """
-    mock_entity_with_model_information(
+    mock_device_with_entities(
+        hass,
         "light.test",
         "osram",
         "LIGHTIFY Plug 01",
@@ -42,4 +42,6 @@ async def test_lightify_plug_selectable(
     data_schema = result["data_schema"]
     model_select: SelectSelector = data_schema.schema["model"]
     model_options = model_select.config["options"]
-    assert {"value": "LIGHTIFY Plug 01", "label": "LIGHTIFY Plug 01 (Osram Lightify Plug 01)"} in model_options
+    # The profile lives under its real model id; "LIGHTIFY Plug 01" is what the integration
+    # reports, and survives as an alias and a legacy id on the profile.
+    assert {"value": "AB3257001NJ", "label": "AB3257001NJ (LIGHTIFY Smart Plug)"} in model_options

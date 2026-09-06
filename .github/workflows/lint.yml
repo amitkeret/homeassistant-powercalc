@@ -2,24 +2,45 @@ name: Lint
 
 on:
   push:
-    branches: [ main ]
+    branches: [ master ]
   pull_request:
   workflow_dispatch:
+
+concurrency:
+  # Supersede in-flight runs for the same pull request; every other event gets a
+  # unique group so pushes, schedules and dispatches never cancel or queue each other.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
 
 jobs:
   pre-commit:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v6
-      - uses: astral-sh/setup-uv@v8.1.0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.14'
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           activate-environment: true
-      - run: uv sync
-      - uses: j178/prek-action@v2
-      - uses: pre-commit-ci/lite-action@v1.1.0
+          enable-cache: "true"
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+        # The type checkers now cover utils/library and .github/scripts, so the
+        # groups holding their third-party imports have to be installed too.
+      - run: uv sync --locked --group library --group profile-library
+      - uses: j178/prek-action@4e14d07f9231acabce116ccfca13b13dd9755ece # v3.0.0
+        with:
+          cache: true
+      - uses: pre-commit-ci/lite-action@5d6cc0eb514c891a40562a58a8e71576c5c7fb43 # v1.1.0
         if: always()
         with:
           msg: 'style: apply pre-commit auto-fixes'

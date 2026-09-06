@@ -1,14 +1,18 @@
 from homeassistant.const import CONF_ENTITY_ID, STATE_IDLE, STATE_PLAYING
 from homeassistant.core import HomeAssistant
 
-from custom_components.powercalc.const import CONF_CALCULATION_ENABLED_CONDITION, CONF_LINEAR, CONF_MAX_POWER, CONF_MODE, CalculationStrategy
+from custom_components.powercalc.const import (
+    CONF_CALCULATION_ENABLED_CONDITION,
+    CONF_LINEAR,
+    CONF_MAX_POWER,
+    CONF_MODE,
+    CalculationStrategy,
+)
 from tests.common import assert_entity_state, run_powercalc_setup, set_states
-from tests.conftest import MockEntityWithModel
 
 
 async def test_media_player_idle(
     hass: HomeAssistant,
-    mock_entity_with_model_information: MockEntityWithModel,
 ) -> None:
     """
     See https://github.com/bramstroker/homeassistant-powercalc/issues/3492

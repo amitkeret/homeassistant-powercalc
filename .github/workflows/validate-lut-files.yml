@@ -3,7 +3,20 @@ name: Validate LUT files
 on:
   pull_request:
     paths:
-       - '**/*.csv.gz'
+      - '**/*.csv.gz'
+      - '.github/workflows/validate-lut-files.yml'
+      - 'utils/library/common.py'
+      - 'utils/library/scan_lut_quality.py'
+      - 'utils/library/validate_lut_files.py'
+
+concurrency:
+  # Supersede in-flight runs for the same pull request; every other event gets a
+  # unique group so pushes, schedules and dispatches never cancel or queue each other.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   validate-lut:
@@ -11,10 +24,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-    - uses: actions/checkout@v6
-    - name: Install dependencies
-      run: |
-        cd .github/scripts/lut_validator
-        npm install
-    - name: Validate LUT CSV files
-      run: node .github/scripts/lut_validator/validate.js
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.14'
+      - name: Validate LUT CSV files
+        run: python -m utils.library.validate_lut_files profile_library
+      - name: Validate LUT quality
+        run: python -m utils.library.scan_lut_quality profile_library --severity error --fail-on-issues

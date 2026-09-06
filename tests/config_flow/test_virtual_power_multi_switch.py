@@ -7,7 +7,7 @@ from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.device_registry import DeviceEntry
 from homeassistant.helpers.entity_registry import EntityRegistry, RegistryEntry
 from homeassistant.helpers.selector import EntitySelector
-from pytest_homeassistant_custom_component.common import RegistryEntryWithDefaults, mock_device_registry, mock_registry
+from pytest_homeassistant_custom_component.common import RegistryEntryWithDefaults, mock_registry
 import voluptuous as vol
 
 from custom_components.powercalc import DiscoveryManager
@@ -28,20 +28,28 @@ from custom_components.powercalc.const import (
 )
 from custom_components.powercalc.power_profile.factory import get_power_profile
 from custom_components.powercalc.power_profile.library import ModelInfo
-from tests.common import assert_entity_state, run_powercalc_setup, set_states
+from tests.common import (
+    assert_entity_state,
+    create_mock_config_entry,
+    mock_device,
+    mock_device_with_entities,
+    mock_entities_in_registry,
+    run_powercalc_setup,
+    set_states,
+)
 from tests.config_flow.common import (
     DEFAULT_UNIQUE_ID,
-    create_mock_entry,
     goto_virtual_power_strategy_step,
+    handle_options_flow_update,
     initialize_discovery_flow,
     initialize_options_flow,
     set_virtual_power_configuration,
 )
-from tests.conftest import MockEntityWithModel
 
 
 async def test_create_multi_switch_sensor_entry(hass: HomeAssistant, entity_registry: EntityRegistry) -> None:
     result = await goto_virtual_power_strategy_step(hass, CalculationStrategy.MULTI_SWITCH, {CONF_NAME: "test"})
+    assert result.get("preview") is None
     result = await set_virtual_power_configuration(
         hass,
         result,
@@ -52,7 +60,11 @@ async def test_create_multi_switch_sensor_entry(hass: HomeAssistant, entity_regi
     entry_data = result["data"]
     assert entry_data[CONF_SENSOR_TYPE] == SensorType.VIRTUAL_POWER
     assert entry_data[CONF_MODE] == CalculationStrategy.MULTI_SWITCH
-    assert entry_data[CONF_MULTI_SWITCH] == {CONF_ENTITIES: ["switch.a", "switch.b"], CONF_POWER: 0.8, CONF_POWER_OFF: 0.5}
+    assert entry_data[CONF_MULTI_SWITCH] == {
+        CONF_ENTITIES: ["switch.a", "switch.b"],
+        CONF_POWER: 0.8,
+        CONF_POWER_OFF: 0.5,
+    }
 
     assert hass.states.get("sensor.test_power")
     assert hass.states.get("sensor.test_energy")
@@ -62,7 +74,6 @@ async def test_create_multi_switch_sensor_entry(hass: HomeAssistant, entity_regi
 
 async def test_discovery_flow(
     hass: HomeAssistant,
-    mock_entity_with_model_information: MockEntityWithModel,
 ) -> None:
     await run_powercalc_setup(hass)
 
@@ -99,13 +110,13 @@ async def test_discovery_flow(
         },
     }
 
-    assert hass.states.get("sensor.test_power")
+    assert hass.states.get("sensor.test_device_power")
 
     await set_states(hass, [("switch.test1", STATE_ON)])
-    assert_entity_state(hass, "sensor.test_power", "1.22")
+    assert_entity_state(hass, "sensor.test_device_power", "1.22")
 
     await set_states(hass, [("switch.test2", STATE_ON)])
-    assert_entity_state(hass, "sensor.test_power", "1.95")
+    assert_entity_state(hass, "sensor.test_device_power", "1.95")
 
 
 async def test_switch_entities_automatically_populated_from_device(hass: HomeAssistant) -> None:
@@ -145,7 +156,7 @@ async def test_discovery_flow_once_per_unique_device(
 
 
 async def test_options_flow(hass: HomeAssistant) -> None:
-    entry = create_mock_entry(
+    entry = await create_mock_config_entry(
         hass,
         {
             CONF_ENTITY_ID: "switch.test",
@@ -156,32 +167,34 @@ async def test_options_flow(hass: HomeAssistant) -> None:
     )
 
     result = await initialize_options_flow(hass, entry, Step.MULTI_SWITCH)
+    assert result.get("preview") is None
 
-    user_input = {CONF_POWER_OFF: 20, CONF_POWER: 5, CONF_ENTITIES: ["switch.a", "switch.c"]}
-    result = await hass.config_entries.options.async_configure(
-        result["flow_id"],
-        user_input=user_input,
+    await handle_options_flow_update(
+        hass,
+        entry,
+        Step.MULTI_SWITCH,
+        {CONF_POWER_OFF: 20, CONF_POWER: 5, CONF_ENTITIES: ["switch.a", "switch.c"]},
     )
 
-    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
     assert entry.data[CONF_MULTI_SWITCH] == {CONF_POWER: 5, CONF_POWER_OFF: 20, CONF_ENTITIES: ["switch.a", "switch.c"]}
 
 
-async def test_regression_2612(hass: HomeAssistant, mock_entity_with_model_information: MockEntityWithModel) -> None:
+async def test_regression_2612(hass: HomeAssistant) -> None:
     """
     See #2612
     When the source entity had manufacturer and model information the multi switch setup would fail
     And raise error "Model not found in library" in the logs
     """
 
-    mock_entity_with_model_information(
+    mock_device_with_entities(
+        hass,
         "switch.test",
         "_TZ3000_u3oupgdy",
         "TS0004",
         unique_id=DEFAULT_UNIQUE_ID,
     )
 
-    create_mock_entry(
+    await create_mock_config_entry(
         hass,
         {
             CONF_ENTITY_ID: "switch.test",
@@ -202,7 +215,9 @@ async def test_regression_2612(hass: HomeAssistant, mock_entity_with_model_infor
     assert hass.states.get("sensor.foo_bar_energy")
 
 
-async def test_setup_without_switches(hass: HomeAssistant, mock_entity_with_model_information: MockEntityWithModel) -> None:
+async def test_setup_without_switches(
+    hass: HomeAssistant,
+) -> None:
     """
     See https://github.com/bramstroker/homeassistant-powercalc/issues/3218
 
@@ -220,7 +235,7 @@ async def test_setup_without_switches(hass: HomeAssistant, mock_entity_with_mode
 
     assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
 
-    assert_entity_state(hass, "sensor.test_power", "0.50")
+    assert_entity_state(hass, "sensor.test_device_power", "0.50")
 
 
 async def test_light_switches_selectable(hass: HomeAssistant) -> None:
@@ -229,35 +244,12 @@ async def test_light_switches_selectable(hass: HomeAssistant) -> None:
     Make sure that light entities are also selectable in the multi switch setup
     """
     device_id = "abcdef"
-    device_entry = DeviceEntry(
-        id=device_id,
-        manufacturer="test",
-        model="multi_switch",
-        name="Test",
-    )
-    mock_device_registry(
+    device_entry = mock_device(hass, device_id, model="multi_switch", name="Test")
+    mock_entities_in_registry(
         hass,
         {
-            device_id: device_entry,
-        },
-    )
-    mock_registry(
-        hass,
-        {
-            "switch.test1": RegistryEntryWithDefaults(
-                id="switch.test1",
-                entity_id="switch.test1",
-                unique_id=f"{device_id}1",
-                device_id=device_id,
-                platform="switch",
-            ),
-            "light.test2": RegistryEntryWithDefaults(
-                id="light.test2",
-                entity_id="light.test2",
-                unique_id=f"{device_id}2",
-                device_id=device_id,
-                platform="light",
-            ),
+            "switch.test1": {"id": "switch.test1", "unique_id": f"{device_id}1", "device_id": device_id},
+            "light.test2": {"id": "light.test2", "unique_id": f"{device_id}2", "device_id": device_id},
         },
     )
 
@@ -305,20 +297,14 @@ async def initialize_device_discovery_flow(hass: HomeAssistant, device_entry: De
     )
 
 
-def mock_device_with_switches(hass: HomeAssistant, num_switches: int = 2, manufacturer: str = "test", model: str = "multi_switch") -> DeviceEntry:
+def mock_device_with_switches(
+    hass: HomeAssistant,
+    num_switches: int = 2,
+    manufacturer: str = "test",
+    model: str = "multi_switch",
+) -> DeviceEntry:
     device_id = "abcdef"
-    device_entry = DeviceEntry(
-        id=device_id,
-        manufacturer=manufacturer,
-        model=model,
-        name="Test",
-    )
-    mock_device_registry(
-        hass,
-        {
-            device_id: device_entry,
-        },
-    )
+    device_entry = mock_device(hass, device_id, manufacturer, model, name="Test")
 
     entities: dict[str, RegistryEntry] = {}
     for i in range(num_switches):

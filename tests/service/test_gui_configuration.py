@@ -2,12 +2,13 @@ import uuid
 
 from homeassistant.const import CONF_ENTITY_ID, CONF_MODE, CONF_UNIQUE_ID
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.typing import ConfigType
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.powercalc.const import (
+    CONF_CREATE_STANDBY_ENERGY_SENSOR,
     CONF_ENERGY_INTEGRATION_METHOD,
     CONF_FIXED,
     CONF_IGNORE_UNAVAILABLE_STATE,
@@ -28,6 +29,7 @@ async def test_change_gui_configuration(hass: HomeAssistant) -> None:
     config_entry_a = create_config_entry(
         "light.a",
         {
+            CONF_CREATE_STANDBY_ENERGY_SENSOR: False,
             CONF_ENERGY_INTEGRATION_METHOD: ENERGY_INTEGRATION_METHOD_RIGHT,
             CONF_IGNORE_UNAVAILABLE_STATE: False,
         },
@@ -37,6 +39,7 @@ async def test_change_gui_configuration(hass: HomeAssistant) -> None:
     config_entry_b = create_config_entry(
         "light.b",
         {
+            CONF_CREATE_STANDBY_ENERGY_SENSOR: False,
             CONF_ENERGY_INTEGRATION_METHOD: ENERGY_INTEGRATION_METHOD_TRAPEZODIAL,
             CONF_IGNORE_UNAVAILABLE_STATE: True,
         },
@@ -54,13 +57,16 @@ async def test_change_gui_configuration(hass: HomeAssistant) -> None:
         CONF_ENERGY_INTEGRATION_METHOD,
         ENERGY_INTEGRATION_METHOD_LEFT,
     )
+    await call_service(hass, CONF_CREATE_STANDBY_ENERGY_SENSOR, "1")
 
     config_entry_a = hass.config_entries.async_get_entry(config_entry_a.entry_id)
     assert config_entry_a.data[CONF_IGNORE_UNAVAILABLE_STATE]
+    assert config_entry_a.data[CONF_CREATE_STANDBY_ENERGY_SENSOR]
     assert config_entry_a.data[CONF_ENERGY_INTEGRATION_METHOD] == ENERGY_INTEGRATION_METHOD_LEFT
 
     config_entry_b = hass.config_entries.async_get_entry(config_entry_b.entry_id)
     assert config_entry_b.data[CONF_IGNORE_UNAVAILABLE_STATE]
+    assert config_entry_b.data[CONF_CREATE_STANDBY_ENERGY_SENSOR]
     assert config_entry_b.data[CONF_ENERGY_INTEGRATION_METHOD] == ENERGY_INTEGRATION_METHOD_LEFT
 
     config_entry_c = hass.config_entries.async_get_entry(config_entry_c.entry_id)
@@ -70,8 +76,9 @@ async def test_change_gui_configuration(hass: HomeAssistant) -> None:
 async def test_error_on_invalid_integration_method(hass: HomeAssistant) -> None:
     await run_powercalc_setup(hass)
 
-    with pytest.raises(HomeAssistantError):
+    with pytest.raises(ServiceValidationError) as exc_info:
         await call_service(hass, CONF_ENERGY_INTEGRATION_METHOD, "foo")
+    assert exc_info.value.translation_key == "invalid_integration_method"
 
 
 async def call_service(hass: HomeAssistant, field: str, value: str) -> None:

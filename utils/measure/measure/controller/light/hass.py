@@ -1,23 +1,50 @@
-from __future__ import annotations
-
-import math
+from collections.abc import Callable, Sequence
 import time
 from typing import Any
 
+from homeassistant_api import State
 from homeassistant_api.errors import HomeassistantAPIError
-import inquirer
 
-from measure.const import QUESTION_ENTITY_ID
 from measure.controller.errors import ApiConnectionError
 from measure.controller.hass_controller import HassControllerBase
-from measure.controller.light.const import MAX_MIRED, MIN_MIRED, LutMode
+from measure.controller.light.capabilities import (
+    common_effects,
+    light_info_from_attributes,
+    merge_light_infos,
+    mired_to_kelvin,
+)
+from measure.controller.light.const import LutMode
 from measure.controller.light.controller import LightController, LightInfo
+from measure.home_assistant import HomeAssistantManager
 
 
 class HassLightController(HassControllerBase, LightController):
-    def __init__(self, api_url: str, token: str, transition_time: int) -> None:
+    """Drive one or more Home Assistant lights as a single measurement target.
+
+    Several identical lights can be measured together to lift a load that is too small
+    to register on its own. They then report the capabilities they have in common.
+    """
+
+    def __init__(
+        self,
+        home_assistant: HomeAssistantManager,
+        transition_time: int,
+        *,
+        entity_ids: Sequence[str],
+        wait: Callable[[float], None] = time.sleep,
+    ) -> None:
+        if not entity_ids:
+            raise ValueError("A light controller needs at least one entity")
         self._transition_time: int = transition_time
-        super().__init__(api_url, token)
+        self._wait = wait
+        # Every light is addressed explicitly, so the base class' single entity_id does not apply.
+        self.entity_ids = list(entity_ids)
+        super().__init__(home_assistant)
+
+    @property
+    def service_target(self) -> str | list[str]:
+        """Entity target for light services: one light stays a plain ID, several become a list."""
+        return self.entity_ids[0] if len(self.entity_ids) == 1 else list(self.entity_ids)
 
     def change_light_state(
         self,
@@ -25,96 +52,76 @@ class HassLightController(HassControllerBase, LightController):
         on: bool = True,
         **kwargs: Any,  # noqa: ANN401
     ) -> None:
-        if not on:
-            self.client.trigger_service("light", "turn_off", entity_id=self.entity_id)
-            return
-
-        json = {
-            LutMode.HS: self.build_hs_json_body,
-            LutMode.COLOR_TEMP: self.build_ct_json_body,
-            LutMode.BRIGHTNESS: self.build_bri_json_body,
-            LutMode.EFFECT: self.build_effect_json_body,
-            LutMode.WHITE: self.build_white_json_body,
-        }.get(lut_mode, self.build_bri_json_body)(**kwargs)
-
         try:
+            if not on:
+                self.client.trigger_service("light", "turn_off", entity_id=self.service_target)
+                return
+
+            if lut_mode == LutMode.HS:
+                json = self.build_hs_json_body(kwargs["bri"], kwargs["hue"], kwargs["sat"])
+            elif lut_mode == LutMode.COLOR_TEMP:
+                json = self.build_ct_json_body(kwargs["bri"], kwargs["ct"])
+            elif lut_mode == LutMode.EFFECT:
+                json = self.build_effect_json_body(kwargs["bri"], kwargs["effect"])
+            elif lut_mode == LutMode.WHITE:
+                json = self.build_white_json_body(kwargs["bri"])
+            else:
+                json = self.build_bri_json_body(kwargs["bri"])
+
             self.client.trigger_service("light", "turn_on", **json)
-        except HomeassistantAPIError as e:
+        except (HomeassistantAPIError, OSError) as e:
             raise ApiConnectionError(f"Failed to change light state: {e}") from e
-        time.sleep(self._transition_time)
+        self._wait(self._transition_time)
 
     def get_light_info(self) -> LightInfo:
-        state = self.client.get_state(entity_id=self.entity_id)
-        attrs = state.attributes
-        min_mired = MIN_MIRED
-        if "max_color_temp_kelvin" in attrs:
-            min_mired = self.kelvin_to_mired(attrs.get("max_color_temp_kelvin"))
-        max_mired = MAX_MIRED
-        if "min_color_temp_kelvin" in attrs:
-            max_mired = self.kelvin_to_mired(attrs.get("min_color_temp_kelvin"))
-        return LightInfo("unknown", min_mired, max_mired)
-
-    def get_questions(self) -> list[inquirer.questions.Question]:
-        return [
-            inquirer.List(
-                name=QUESTION_ENTITY_ID,
-                message="Select the light entity",
-                choices=self.get_domain_entity_list("light"),
-            ),
-        ]
+        return merge_light_infos([light_info_from_attributes(state.attributes) for state in self._states()])
 
     def has_effect_support(self) -> bool:
         return True
 
     def get_effect_list(self) -> list[str]:
-        light_state = self.client.get_state(entity_id=self.entity_id)
-        return light_state.attributes.get("effect_list", [])
+        return common_effects(
+            [[str(effect) for effect in (state.attributes.get("effect_list") or [])] for state in self._states()],
+        )
 
-    def process_answers(self, answers: dict[str, Any]) -> None:
-        super().process_answers(answers)
+    def close(self) -> None:
+        return
 
-    def build_hs_json_body(self, bri: int, hue: int, sat: int) -> dict:
+    def build_hs_json_body(self, bri: int, hue: int, sat: int) -> dict[str, Any]:
         return {
-            "entity_id": self.entity_id,
+            "entity_id": self.service_target,
             "transition": self._transition_time,
             "brightness": bri,
             "hs_color": [hue / 65535 * 360, sat / 255 * 100],
         }
 
-    def build_ct_json_body(self, bri: int, ct: int) -> dict:
+    def build_ct_json_body(self, bri: int, ct: int) -> dict[str, Any]:
         return {
-            "entity_id": self.entity_id,
+            "entity_id": self.service_target,
             "transition": self._transition_time,
             "brightness": bri,
-            "color_temp_kelvin": self.mired_to_kelvin(ct),
+            "color_temp_kelvin": mired_to_kelvin(ct),
         }
 
-    def build_bri_json_body(self, bri: int) -> dict:
+    def build_bri_json_body(self, bri: int) -> dict[str, Any]:
         return {
-            "entity_id": self.entity_id,
+            "entity_id": self.service_target,
             "transition": self._transition_time,
             "brightness": bri,
         }
 
-    def build_effect_json_body(self, bri: int, effect: str) -> dict:
+    def build_effect_json_body(self, bri: int, effect: str) -> dict[str, Any]:
         return {
-            "entity_id": self.entity_id,
+            "entity_id": self.service_target,
             "effect": effect,
             "brightness": bri,
         }
 
-    def build_white_json_body(self, bri: int) -> dict:
+    def build_white_json_body(self, bri: int) -> dict[str, Any]:
         return {
-            "entity_id": self.entity_id,
+            "entity_id": self.service_target,
             "white": bri,
         }
 
-    @staticmethod
-    def kelvin_to_mired(kelvin_temperature: float) -> int:
-        """Convert degrees kelvin to mired shift."""
-        return math.floor(1000000 / kelvin_temperature)
-
-    @staticmethod
-    def mired_to_kelvin(mired_temperature: float) -> int:
-        """Convert absolute mired shift to degrees kelvin."""
-        return math.floor(1000000 / mired_temperature)
+    def _states(self) -> list[State]:
+        return [self.client.get_state(entity_id=entity_id) for entity_id in self.entity_ids]

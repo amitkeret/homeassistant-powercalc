@@ -1,29 +1,86 @@
 name: Validate model.json
 
 on:
-  pull_request_target:
+  pull_request:
     paths:
-       - '**/model.json'
-       - 'profile_library/model_schema.json'
+      - '**/model.json'
+      - '**/manufacturer.json'
+      - 'profile_library/model_schema.json'
+      - 'profile_library/manufacturer_schema.json'
+      - '.github/scripts/profile_library/validate_model_json.py'
+      - '.github/workflows/validate-model-json.yml'
+
+concurrency:
+  # Supersede in-flight runs for the same pull request; every other event gets a
+  # unique group so pushes, schedules and dispatches never cancel or queue each other.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
 
 permissions:
-  issues: write
-  pull-requests: write
+  contents: read
 
 jobs:
   validate_model_json:
     name: Validate model.json
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout trusted validation code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{github.event.pull_request.head.ref}}
-          repository: ${{github.event.pull_request.head.repo.full_name}}
-      - name: Validate model.json against schema
-        uses: bramstroker/json-schema-validator@master
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          persist-credentials: false
+      - name: Checkout PR files
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          json_schema: ./profile_library/model_schema.json
-          json_path_pattern: ^profile_library/[^/]+/[^/]+/model.json$
-          send_comment: true
-          clear_comments: true
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: '0.12.9'
+          enable-cache: true
+          cache-dependency-glob: |
+            base/pyproject.toml
+            base/uv.lock
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        name: List changed files from the PR
+        id: list-files
+        with:
+          script: |
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number
+            });
+            require('fs').writeFileSync('pr/changed_files.json', JSON.stringify(files.map(file => file.filename)));
+      - name: Initialize validation result
+        run: |
+          mkdir -p validation-result
+          echo "${{ github.event.pull_request.number }}" > validation-result/pr_number.txt
+          echo "failure" > validation-result/model_json_validation_status.txt
+          {
+            echo "<!-- model.json validate action comment -->"
+            echo
+            echo "The model.json validation workflow failed before it could write a detailed report."
+          } > validation-result/model_json_validation_report.md
+      - name: Validate model.json and manufacturer.json against their schemas
+        working-directory: pr
+        run: >-
+          uv run --locked --project ../base --only-group library --no-build
+          python ../base/.github/scripts/profile_library/validate_model_json.py
+          --model-schema profile_library/model_schema.json
+          --manufacturer-schema profile_library/manufacturer_schema.json
+          --changed-files changed_files.json
+          --report ../validation-result/model_json_validation_report.md
+          --status ../validation-result/model_json_validation_status.txt
+      - name: Upload validation result
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: model-json-validation
+          path: |
+            ./validation-result/pr_number.txt
+            ./validation-result/model_json_validation_report.md
+            ./validation-result/model_json_validation_status.txt

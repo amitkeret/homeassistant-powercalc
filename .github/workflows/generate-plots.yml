@@ -3,28 +3,43 @@ name: Generate plots
 on:
   push:
     paths:
-      - '**/*.csv.gz'
+      - 'profile_library/**/*.csv.gz'
+      - 'profile_library/**/model.json'
     branches:
       - master
   workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: profile-library-writes
+  cancel-in-progress: false
 
 jobs:
   format:
     name: Generate plots
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - uses: astral-sh/setup-uv@v8.1.0
+          persist-credentials: true
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
-          working-directory: './utils/visualize'
+          version: '0.12.9'
+          working-directory: './utils/measure'
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
       - name: Run visualization tool
-        run: |
-          cd ./utils/visualize && bash generate-all.sh ../../profile_library
-      - uses: EndBug/add-and-commit@v10
+        run: uv --project utils/measure run --locked --group visualize powercalc-visualize ./profile_library
+      - uses: EndBug/add-and-commit@cc9c08ba6c8df3b93a8f2db63e89b98368ae2ae8 # v11
         if: github.ref == 'refs/heads/master'
         with:
-          message: 'chore: generate plots'
+          message: 'chore(profile): generate plots'
           pull: '--rebase --autostash'
+          push: 'origin HEAD:master'

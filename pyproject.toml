@@ -23,7 +23,10 @@ dependencies = ["homeassistant"]
 license = "MIT"
 
 [tool.pytest.ini_options]
-testpaths = "tests"
+testpaths = [
+    "tests",
+    "utils/library/tests",
+]
 norecursedirs = ".git"
 asyncio_mode = "auto"
 markers = [
@@ -38,75 +41,113 @@ known-third-party = ["homeassistant"]
 force-sort-within-sections = true
 combine-as-imports = true
 
+[tool.ty.environment]
+# The release-draft entry points run as plain scripts and import their siblings flat.
+extra-paths = [".github/scripts/release_draft"]
+
+[tool.ty.src]
+# Test suites are exercised by pytest, not by the type checker.
+exclude = ["**/tests/"]
+
+[tool.ty.analysis]
+allowed-unresolved-imports = [
+    "homeassistant.components.**",
+]
+
 [tool.mypy]
 python_version = "3.14"
 show_error_codes = true
 follow_imports = "silent"
+strict = true
+# Not covered by `strict`
 local_partial_types = true
-strict_equality = true
-no_implicit_optional = false
 warn_incomplete_stub = true
-warn_redundant_casts = true
 warn_unused_configs = true
-warn_unused_ignores = true
-check_untyped_defs = true
-disallow_incomplete_defs = true
-disallow_subclassing_any = true
-disallow_untyped_calls = true
-disallow_untyped_decorators = true
-disallow_untyped_defs = true
-warn_return_any = true
 warn_unreachable = true
+# The release-draft entry points are executed as plain scripts, so their sibling
+# modules are imported flat. Put that directory on the search path and make mypy
+# derive module names from an explicit base instead of walking up to __init__.py.
+mypy_path = ".github/scripts/release_draft"
+explicit_package_bases = true
+# Test suites are exercised by pytest, not by the type checker.
+exclude = ["/tests/"]
 
 [[tool.mypy.overrides]]
 module = "homeassistant.components.*"
 ignore_missing_imports = true
 
-[[tool.mypy.overrides]]
-module = "custom_components.powercalc.config_flow"
-disable_error_code = "return-value"
-
 [tool.coverage.paths]
 source = ["custom_components/powercalc", "utils", "tests"]
 
+[tool.coverage.report]
+fail_under = 100
+precision = 2
+show_missing = true
+
 [tool.ruff]
-line-length = 150
-target-version = "py313"
-exclude = ["utils/measure/playground", "utils/visualize", ".github", "docs"]
+line-length = 120
+target-version = "py314"
+exclude = ["utils/measure/playground", "docs"]
 
 [tool.ruff.lint]
-select = ["A", "ANN", "ASYNC", "B", "BLE", "C", "C4", "COM", "E", "F", "FIX", "FURB", "G", "ICN", "I", "INP", "ISC", "LOG", "N", "NPY", "PERF", "PIE", "PYI", "Q", "RET", "RUF", "S", "SIM", "SLF", "SLOT", "T10", "T20", "TID", "UP", "W"]
-ignore = ["S101", "ASYNC240", "COM812"]
+select = ["A", "ANN", "ASYNC", "B", "BLE", "C", "C4", "COM", "E", "F", "FAST", "FIX", "FLY", "FURB", "G", "ICN", "I", "INP", "ISC", "LOG", "N", "NPY", "PERF", "PIE", "PLE", "PT", "PYI", "Q", "RET", "RSE", "RUF", "S", "SIM", "SLF", "SLOT", "T10", "T20", "TID", "UP", "W", "YTT"]
+# COM812 is enforced by the formatter itself; keeping it selected only causes
+# the formatter-conflict warning. COM818 (bare tuple) stays enabled.
+ignore = ["S101", "COM812"]
 
 [tool.ruff.lint.per-file-ignores]
+".github/scripts/**.py" = ["T201"]
+"utils/library/update_library.py" = ["T201"]
 "utils/measure/**.py" = ["T201"]
 "tests/**.py" = ["ASYNC230"]
 
+[tool.ruff.lint.flake8-pytest-style]
+# The test suite consistently declares parametrize names as a single csv string
+# ("a,b,c") rather than a tuple, so match that instead of ruff's tuple default.
+parametrize-names-type = "csv"
+
 [tool.ruff.lint.mccabe]
-max-complexity = 15
+max-complexity = 10
 
 [tool.uv]
 prerelease = "allow"
 override-dependencies = [
   "mashumaro[msgpack]==3.17",
+  "habluetooth>=6.8.1",
 ]
 
 [dependency-groups]
 docs = [
     "zensical>=0.0.5",
 ]
+library = [
+    "jsonschema>=4.0",
+    "pytablewriter==1.2.1",
+]
+profile-library = [
+    "aiofiles>=25.1.0",
+    "gitpython>=3.1.57",
+    "httpx>=0.28.1",
+]
 dev = [
+    "aiofiles>=25.1.0",
+    "gitpython>=3.1.57",
+    "httpx>=0.28.1",
     "prek",
     "ruff>=0.15.0",
-    "mypy==2.0.0",
+    "mypy==2.3.1",
     "voluptuous-stubs>=0.1",
+    "probatio>=0.11.2",
     "homeassistant-stubs",
-    "pytest-homeassistant-custom-component==0.13.330",
+    "pytest-homeassistant-custom-component==0.13.363",
     "types-pytz>=2024.1",
     "types-croniter>=2.0",
     "croniter>=6.0.0",
     "aioresponses>=0.7.6",
-    "pyturbojpeg>=1.8.2"
+    "pyturbojpeg>=1.8.2",
+    "ty>=0.0.39",
+    "types-jsonschema>=4.26.0.20260518",
+    "types-aiofiles>=25.1.0.20260518",
 ]
 
 [tool.setuptools]

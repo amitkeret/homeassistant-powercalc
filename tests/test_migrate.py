@@ -1,8 +1,10 @@
 from datetime import timedelta
 from unittest.mock import AsyncMock, Mock, patch
 
-from homeassistant.const import CONF_ENABLED, CONF_ENTITY_ID, CONF_NAME
+from homeassistant.const import CONF_DEVICE, CONF_ENABLED, CONF_ENTITY_ID, CONF_NAME, EntityCategory
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
+import homeassistant.helpers.entity_registry as er
 from homeassistant.helpers.issue_registry import IssueRegistry
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -32,6 +34,7 @@ from custom_components.powercalc.const import (
     CONF_PLAYBOOK,
     CONF_PLAYBOOKS,
     CONF_POWER,
+    CONF_POWER_SENSOR_CATEGORY,
     CONF_SENSOR_TYPE,
     CONF_STATE,
     CONF_STATE_TRIGGER,
@@ -43,7 +46,9 @@ from custom_components.powercalc.const import (
     SensorType,
 )
 from custom_components.powercalc.power_profile.library import ModelInfo
-from tests.common import run_powercalc_setup
+from tests.common import migrate_legacy_entry, mock_devices, requires_composite_devices, run_powercalc_setup
+
+COMPOSITE_ID = "composite00000000000000000000ab"
 
 
 async def test_legacy_discovery_config_raises_issue(hass: HomeAssistant, issue_registry: IssueRegistry) -> None:
@@ -77,7 +82,10 @@ async def test_legacy_update_interval_config_issue_raised(hass: HomeAssistant, i
     assert CONF_FORCE_UPDATE_FREQUENCY_DEPRECATED not in global_config
 
 
-async def test_legacy_update_interval_config_issue_not_raised(hass: HomeAssistant, issue_registry: IssueRegistry) -> None:
+async def test_legacy_update_interval_config_issue_not_raised(
+    hass: HomeAssistant,
+    issue_registry: IssueRegistry,
+) -> None:
     await run_powercalc_setup(hass)
 
     assert not issue_registry.async_get_issue(DOMAIN, "legacy_update_interval_config")
@@ -85,9 +93,9 @@ async def test_legacy_update_interval_config_issue_not_raised(hass: HomeAssistan
 
 async def test_migrate_config_entry_playbooks(hass: HomeAssistant) -> None:
     """Test migration of a config entry to version 6"""
-    mock_entry = MockConfigEntry(
-        domain=DOMAIN,
-        data={
+    mock_entry = await migrate_legacy_entry(
+        hass,
+        {
             CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
             CONF_MODE: CalculationStrategy.PLAYBOOK,
             CONF_PLAYBOOK: {
@@ -99,10 +107,6 @@ async def test_migrate_config_entry_playbooks(hass: HomeAssistant) -> None:
         },
         version=5,
     )
-    mock_entry.add_to_hass(hass)
-    await async_migrate_entry(hass, mock_entry)
-    hass.config_entries.async_get_entry(mock_entry.entry_id)
-    assert mock_entry.version == PowercalcConfigFlow.VERSION
     assert mock_entry.data[CONF_PLAYBOOK][CONF_PLAYBOOKS] == [
         {"id": "evening_playbook", "path": "evening_playbook.yaml"},
         {"id": "morning_playbook", "path": "morning_playbook.yaml"},
@@ -113,9 +117,9 @@ async def test_migrate_config_entry_version_4(hass: HomeAssistant) -> None:
     """
     Test that a config entry is migrated from version 3 to version 4.
     """
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        data={
+    entry = await migrate_legacy_entry(
+        hass,
+        {
             CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
             CONF_NAME: "testentry",
             CONF_ENTITY_ID: DUMMY_ENTITY_ID,
@@ -127,11 +131,6 @@ async def test_migrate_config_entry_version_4(hass: HomeAssistant) -> None:
         },
         version=3,
     )
-    entry.add_to_hass(hass)
-
-    await async_migrate_entry(hass, entry)
-
-    assert entry.version == PowercalcConfigFlow.VERSION
     assert entry.data == {
         CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
         CONF_NAME: "testentry",
@@ -148,21 +147,16 @@ async def test_migrate_config_entry_version_5(hass: HomeAssistant) -> None:
     """
     Test that a config entry is migrated from version 4 to version 5.
     """
-    entry = MockConfigEntry(
-        entry_id=ENTRY_GLOBAL_CONFIG_UNIQUE_ID,
-        domain=DOMAIN,
-        data={
+    entry = await migrate_legacy_entry(
+        hass,
+        {
             CONF_DISCOVERY_EXCLUDE_SELF_USAGE_DEPRECATED: True,
             CONF_DISCOVERY_EXCLUDE_DEVICE_TYPES_DEPRECATED: [DeviceType.COVER],
             CONF_ENABLE_AUTODISCOVERY_DEPRECATED: False,
         },
         version=4,
+        unique_id=ENTRY_GLOBAL_CONFIG_UNIQUE_ID,
     )
-    entry.add_to_hass(hass)
-
-    await async_migrate_entry(hass, entry)
-
-    assert entry.version == PowercalcConfigFlow.VERSION
     assert entry.data == {
         CONF_DISCOVERY: {
             CONF_ENABLED: False,
@@ -174,9 +168,9 @@ async def test_migrate_config_entry_version_5(hass: HomeAssistant) -> None:
 
 async def test_migrate_config_entry_states_power(hass: HomeAssistant) -> None:
     """Test migration of states_power from dict to list format (version 6 to 7)."""
-    mock_entry = MockConfigEntry(
-        domain=DOMAIN,
-        data={
+    mock_entry = await migrate_legacy_entry(
+        hass,
+        {
             CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
             CONF_MODE: CalculationStrategy.FIXED,
             CONF_FIXED: {
@@ -189,9 +183,6 @@ async def test_migrate_config_entry_states_power(hass: HomeAssistant) -> None:
         },
         version=6,
     )
-    mock_entry.add_to_hass(hass)
-    await async_migrate_entry(hass, mock_entry)
-    assert mock_entry.version == PowercalcConfigFlow.VERSION
     assert mock_entry.data[CONF_FIXED][CONF_STATES_POWER] == [
         {CONF_STATE: "playing", CONF_POWER: 20},
         {CONF_STATE: "paused", CONF_POWER: 5},
@@ -199,8 +190,117 @@ async def test_migrate_config_entry_states_power(hass: HomeAssistant) -> None:
     ]
 
 
+async def test_migrate_config_entry_removes_invalid_power_sensor_category(hass: HomeAssistant) -> None:
+    """Test migration removes the no longer valid config entity category from power sensors."""
+    mock_entry = await migrate_legacy_entry(
+        hass,
+        {
+            CONF_POWER_SENSOR_CATEGORY: EntityCategory.CONFIG,
+        },
+        version=7,
+    )
+
+    assert CONF_POWER_SENSOR_CATEGORY not in mock_entry.data
+
+
+async def test_migrate_config_entry_keeps_diagnostic_power_sensor_category(hass: HomeAssistant) -> None:
+    """Test migration keeps still valid power sensor categories."""
+    mock_entry = await migrate_legacy_entry(
+        hass,
+        {
+            CONF_POWER_SENSOR_CATEGORY: EntityCategory.DIAGNOSTIC,
+        },
+        version=7,
+    )
+
+    assert mock_entry.data[CONF_POWER_SENSOR_CATEGORY] == EntityCategory.DIAGNOSTIC
+
+
+@requires_composite_devices
+@pytest.mark.parametrize("configured_device_id", [None, COMPOSITE_ID], ids=["source_entity", "configured_device"])
+async def test_migrate_config_entry_removes_split_helper_device(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    configured_device_id: str | None,
+) -> None:
+    """Test migration removes a helper-owned split with the 2026.8 API."""
+    source_entry = MockConfigEntry(domain="test")
+    source_entry.add_to_hass(hass)
+    powercalc_entry_data = {
+        CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
+        CONF_ENTITY_ID: "switch.source_switch",
+        CONF_FIXED: {CONF_POWER: 50},
+    }
+    if configured_device_id is not None:
+        powercalc_entry_data[CONF_DEVICE] = configured_device_id
+    powercalc_entry = MockConfigEntry(domain=DOMAIN, data=powercalc_entry_data, version=8)
+    powercalc_entry.add_to_hass(hass)
+
+    devices = mock_devices(
+        hass,
+        {
+            "source-device": {
+                "config_entry_id": source_entry.entry_id,
+                "identifiers": {("test", "source")},
+                "composite_device_id": COMPOSITE_ID,
+            },
+            "helper-device": {
+                "config_entry_id": powercalc_entry.entry_id,
+                "identifiers": {(DOMAIN, "helper")},
+                "composite_device_id": COMPOSITE_ID,
+            },
+        },
+    )
+    device_registry = dr.async_get(hass)
+    source_device = devices["source-device"]
+    helper_device = devices["helper-device"]
+    helper_entity = entity_registry.async_get_or_create(
+        "sensor",
+        DOMAIN,
+        "test_power",
+        config_entry=powercalc_entry,
+        device_id=helper_device.id,
+    )
+
+    await async_migrate_entry(hass, powercalc_entry)
+
+    assert device_registry.async_get(source_device.id)
+    assert device_registry.async_get(helper_device.id) is None
+    migrated_entity = entity_registry.async_get(helper_entity.entity_id)
+    assert migrated_entity
+    assert migrated_entity.device_id is None
+    assert powercalc_entry.version == PowercalcConfigFlow.VERSION
+
+
+@requires_composite_devices
+async def test_migrate_config_entry_removes_legacy_device_link(hass: HomeAssistant) -> None:
+    """Test migration removes the legacy device link on older HA versions."""
+    powercalc_entry = MockConfigEntry(domain=DOMAIN, version=8)
+    powercalc_entry.add_to_hass(hass)
+    device_entry = mock_devices(
+        hass,
+        {"source-device": {"config_entry_id": powercalc_entry.entry_id, "identifiers": {("test", "source")}}},
+    )["source-device"]
+    remove_legacy_link = Mock()
+
+    with (
+        patch("custom_components.powercalc.migrate.helper_integration.async_remove_helper_devices", None),
+        patch(
+            "custom_components.powercalc.migrate.helper_integration.async_remove_helper_config_entry_from_source_device",
+            remove_legacy_link,
+        ),
+    ):
+        await async_migrate_entry(hass, powercalc_entry)
+
+    remove_legacy_link.assert_called_once_with(
+        hass,
+        helper_config_entry_id=powercalc_entry.entry_id,
+        source_device_id=device_entry.id,
+    )
+
+
 @pytest.mark.parametrize(
-    ("input_model", "migrated_profile", "expected_model", "expect_update"),
+    "input_model, migrated_profile, expected_model, expect_update",
     [
         ("33955", ModelInfo("eglo", "900053"), "900053", True),
         ("33955/default", ModelInfo("eglo", "900053"), "900053/default", True),
@@ -223,7 +323,7 @@ async def test_fix_legacy_library_model_reference(
             CONF_MANUFACTURER: "eglo",
             CONF_MODEL: input_model,
         },
-        version=7,
+        version=PowercalcConfigFlow.VERSION,
     )
     mock_entry.add_to_hass(hass)
 
@@ -232,7 +332,11 @@ async def test_fix_legacy_library_model_reference(
 
     with (
         patch("custom_components.powercalc.migrate.ProfileLibrary.factory", AsyncMock(return_value=library)),
-        patch.object(hass.config_entries, "async_update_entry", wraps=hass.config_entries.async_update_entry) as mock_update_entry,
+        patch.object(
+            hass.config_entries,
+            "async_update_entry",
+            wraps=hass.config_entries.async_update_entry,
+        ) as mock_update_entry,
     ):
         await async_fix_legacy_profile_config_entry(hass, mock_entry)
 

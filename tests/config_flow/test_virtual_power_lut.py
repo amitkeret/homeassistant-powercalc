@@ -1,5 +1,5 @@
 from homeassistant import data_entry_flow
-from homeassistant.components.light import ColorMode
+from homeassistant.components.light import ATTR_COLOR_MODE, ATTR_SUPPORTED_COLOR_MODES, ColorMode
 from homeassistant.const import CONF_ENTITY_ID, STATE_ON
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.selector import SelectSelector
@@ -17,25 +17,32 @@ from custom_components.powercalc.const import (
     SensorType,
 )
 from custom_components.powercalc.flow_helper.flows.library import CONF_CONFIRM_AUTODISCOVERED_MODEL
-from custom_components.test.light import MockLight
-from tests.common import create_mock_light_entity
+from tests.common import create_mock_config_entry, mock_device_with_entities, mock_entities_in_registry, set_states
 from tests.config_flow.common import (
     DEFAULT_UNIQUE_ID,
     assert_default_virtual_power_entry_data,
     confirm_auto_discovered_model,
-    create_mock_entry,
     goto_virtual_power_strategy_step,
-    initialize_options_flow,
+    handle_options_flow_update,
     set_virtual_power_configuration,
 )
-from tests.conftest import MockEntityWithModel
 
 
 async def test_lut_manual_flow(hass: HomeAssistant) -> None:
-    light_entity = MockLight("test", STATE_ON, DEFAULT_UNIQUE_ID)
-    light_entity.supported_color_modes = [ColorMode.COLOR_TEMP, ColorMode.HS]
-    light_entity.color_mode = ColorMode.COLOR_TEMP
-    await create_mock_light_entity(hass, light_entity)
+    mock_entities_in_registry(hass, {"light.test": {"unique_id": DEFAULT_UNIQUE_ID}})
+    await set_states(
+        hass,
+        [
+            (
+                "light.test",
+                STATE_ON,
+                {
+                    ATTR_SUPPORTED_COLOR_MODES: [ColorMode.COLOR_TEMP, ColorMode.HS],
+                    ATTR_COLOR_MODE: ColorMode.COLOR_TEMP,
+                },
+            ),
+        ],
+    )
 
     result = await goto_virtual_power_strategy_step(hass, CalculationStrategy.LUT)
     assert result["type"] == data_entry_flow.FlowResultType.FORM
@@ -57,7 +64,7 @@ async def test_lut_manual_flow(hass: HomeAssistant) -> None:
     model_select: SelectSelector = data_schema.schema["model"]
     model_options = model_select.config["options"]
     assert {"value": "LCT010", "label": "LCT010 (Hue White and Color Ambiance A19 E26 (Gen 3))"} in model_options
-    assert {"value": "LWB010", "label": "LWB010 (Hue White Bulb A60 E27 806lm)"} in model_options
+    assert {"value": "LWB010", "label": "LWB010 (Hue White Bulb A60 B22 806lm)"} in model_options
 
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
@@ -83,11 +90,11 @@ async def test_lut_manual_flow(hass: HomeAssistant) -> None:
 
 async def test_lut_autodiscover_flow(
     hass: HomeAssistant,
-    mock_entity_with_model_information: MockEntityWithModel,
 ) -> None:
     manufacturer = "ikea"
     model = "LED1545G12"
-    mock_entity_with_model_information(
+    mock_device_with_entities(
+        hass,
         "light.test",
         manufacturer,
         model,
@@ -100,6 +107,7 @@ async def test_lut_autodiscover_flow(
     assert result["description_placeholders"] == {
         "manufacturer": "ikea",
         "model": "LED1545G12",
+        "profile_details": ("\n\n[View measurement details](https://library.powercalc.nl/profiles/ikea/led1545g12)"),
         "remarks": None,
         "source": "Source entity: light.test",
     }
@@ -124,9 +132,8 @@ async def test_lut_autodiscover_flow(
 
 async def test_lut_not_autodiscovered_model_unsupported(
     hass: HomeAssistant,
-    mock_entity_with_model_information: MockEntityWithModel,
 ) -> None:
-    mock_entity_with_model_information("light.test", "ikea", "unknown_model")
+    mock_device_with_entities(hass, "light.test", "ikea", "unknown_model")
 
     result = await goto_virtual_power_strategy_step(hass, CalculationStrategy.LUT)
     assert result["type"] == data_entry_flow.FlowResultType.FORM
@@ -134,9 +141,9 @@ async def test_lut_not_autodiscovered_model_unsupported(
 
 
 async def test_lut_not_autodiscovered(hass: HomeAssistant) -> None:
-    light_entity = MockLight("test", STATE_ON)
-    light_entity._attr_unique_id = None  # noqa
-    await create_mock_light_entity(hass, light_entity)
+    # Without a unique id the light cannot be autodiscovered.
+    mock_entities_in_registry(hass, {"light.test": {"unique_id": None}})
+    await set_states(hass, [("light.test", STATE_ON)])
 
     result = await goto_virtual_power_strategy_step(hass, CalculationStrategy.LUT)
     assert result["type"] == data_entry_flow.FlowResultType.FORM
@@ -145,13 +152,13 @@ async def test_lut_not_autodiscovered(hass: HomeAssistant) -> None:
 
 async def test_lut_autodiscover_flow_not_confirmed(
     hass: HomeAssistant,
-    mock_entity_with_model_information: MockEntityWithModel,
 ) -> None:
     """
     When manufacturer and model are auto detected and user chooses to not accept it,
     make sure he/she is forwarded to the manufacturer listing
     """
-    mock_entity_with_model_information(
+    mock_device_with_entities(
+        hass,
         "light.test",
         "ikea",
         "LED1545G12",
@@ -170,9 +177,8 @@ async def test_lut_autodiscover_flow_not_confirmed(
 
 async def test_lut_flow_with_sub_profiles(
     hass: HomeAssistant,
-    mock_entity_with_model_information: MockEntityWithModel,
 ) -> None:
-    mock_entity_with_model_information("light.test", "", "")
+    mock_device_with_entities(hass, "light.test", "", "")
 
     result = await goto_virtual_power_strategy_step(hass, CalculationStrategy.LUT)
 
@@ -208,7 +214,7 @@ async def test_lut_flow_with_sub_profiles(
 
 
 async def test_lut_options_flow(hass: HomeAssistant) -> None:
-    entry = create_mock_entry(
+    entry = await create_mock_config_entry(
         hass,
         {
             CONF_ENTITY_ID: "light.spots_kitchen",
@@ -220,14 +226,6 @@ async def test_lut_options_flow(hass: HomeAssistant) -> None:
         },
     )
 
-    result = await initialize_options_flow(hass, entry, Step.BASIC_OPTIONS)
+    await handle_options_flow_update(hass, entry, Step.BASIC_OPTIONS, {CONF_CREATE_ENERGY_SENSOR: False})
 
-    user_input = {CONF_CREATE_ENERGY_SENSOR: False}
-
-    result = await hass.config_entries.options.async_configure(
-        result["flow_id"],
-        user_input=user_input,
-    )
-
-    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
     assert not entry.data[CONF_CREATE_ENERGY_SENSOR]

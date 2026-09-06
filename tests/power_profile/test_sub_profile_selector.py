@@ -1,16 +1,20 @@
 from homeassistant.const import STATE_OFF, STATE_ON
 from homeassistant.core import HomeAssistant, State
-from homeassistant.helpers.device_registry import DeviceEntry
+from homeassistant.helpers.device_registry import DeviceRegistry
 from homeassistant.helpers.entity_registry import RegistryEntry
 import pytest
-from pytest_homeassistant_custom_component.common import RegistryEntryWithDefaults
+from pytest_homeassistant_custom_component.common import MockConfigEntry, RegistryEntryWithDefaults
 
 from custom_components.powercalc.common import SourceEntity
 from custom_components.powercalc.errors import PowercalcSetupError
 from custom_components.powercalc.power_profile.library import ModelInfo, ProfileLibrary
 from custom_components.powercalc.power_profile.power_profile import PowerProfile
-from custom_components.powercalc.power_profile.sub_profile_selector import EntityRegistryMatcher, ModelIdMatcher, SubProfileSelector
-from tests.common import get_test_profile_dir
+from custom_components.powercalc.power_profile.sub_profile_selector import (
+    EntityRegistryMatcher,
+    ModelIdMatcher,
+    SubProfileSelector,
+)
+from tests.common import build_device_entry, get_test_profile_dir, requires_child_devices
 
 
 async def test_matcher_attribute(hass: HomeAssistant) -> None:
@@ -108,7 +112,7 @@ async def test_matcher_integration(
 
 
 @pytest.mark.parametrize(
-    ("registry_entry", "expected_profile"),
+    "registry_entry, expected_profile",
     [
         (
             RegistryEntryWithDefaults(
@@ -161,7 +165,13 @@ async def test_matcher_entity_registry_property(
 
 
 def test_matcher_entity_registry_list_value() -> None:
-    entry = RegistryEntryWithDefaults(entity_id="switch.test", unique_id="1111", platform="test", aliases=["abc", "def"], suggested_object_id="test")
+    entry = RegistryEntryWithDefaults(
+        entity_id="switch.test",
+        unique_id="1111",
+        platform="test",
+        aliases=["abc", "def"],
+        suggested_object_id="test",
+    )
 
     matcher = EntityRegistryMatcher("aliases", "abc", "my_profile")
     result = matcher.match(
@@ -172,7 +182,13 @@ def test_matcher_entity_registry_list_value() -> None:
 
 
 def test_matcher_entity_registry_no_value() -> None:
-    entry = RegistryEntryWithDefaults(entity_id="switch.test", unique_id="1111", platform="test", entity_category=None, suggested_object_id="test")
+    entry = RegistryEntryWithDefaults(
+        entity_id="switch.test",
+        unique_id="1111",
+        platform="test",
+        entity_category=None,
+        suggested_object_id="test",
+    )
 
     matcher = EntityRegistryMatcher("entity_category", "abc", "my_profile")
     result = matcher.match(
@@ -201,7 +217,7 @@ async def test_matcher_model_id(
         custom_directory=get_test_profile_dir("sub_profile_match_model_id"),
     )
 
-    device_entry = DeviceEntry(id="abc", model_id=model_id)
+    device_entry = build_device_entry(config_entry_id="test", id="abc", model_id=model_id)
     source_entity = SourceEntity(
         entity_id="light.test",
         domain="light",
@@ -224,29 +240,61 @@ async def test_matcher_model_id(
         assert power_profile.sub_profile == expected_profile
 
 
-async def test_matcher_model_id_no_device_entry() -> None:
+def test_matcher_model_id_no_device_entry() -> None:
     matcher = ModelIdMatcher("foo", "bar")
-    assert matcher.match(State("light.test", STATE_ON), SourceEntity(entity_id="light.test", domain="light", object_id="test")) is None
-
-
-async def test_exception_is_raised_when_invalid_sub_profile_matcher_supplied(
-    hass: HomeAssistant,
-) -> None:
-    with pytest.raises(PowercalcSetupError):
-        power_profile = PowerProfile(
-            hass,
-            manufacturer="Foo",
-            model="Bar",
-            directory="",
-            json_data={
-                "sub_profile_select": {
-                    "matchers": [{"type": "invalid_type"}],
-                    "default": "henkie",
-                },
-            },
-        )
-        SubProfileSelector(
-            hass,
-            power_profile.sub_profile_select,
+    assert (
+        matcher.match(
+            State("light.test", STATE_ON),
             SourceEntity(entity_id="light.test", domain="light", object_id="test"),
         )
+        is None
+    )
+
+
+@requires_child_devices
+def test_matcher_model_id_ignores_child_device(
+    hass: HomeAssistant,
+    device_registry: DeviceRegistry,
+) -> None:
+    config_entry = MockConfigEntry(domain="test")
+    config_entry.add_to_hass(hass)
+    parent = device_registry.async_get_or_create(
+        config_entry_id=config_entry.entry_id,
+        identifiers={("test", "parent")},
+        name="Parent",
+    )
+    child = device_registry.async_get_or_create_child(
+        config_entry_id=config_entry.entry_id,
+        identifiers={("test", "child")},
+        name="Child",
+        parent_device_id=parent.id,
+    )
+
+    matcher = ModelIdMatcher("foo", "bar")
+    assert (
+        matcher.match(
+            State("light.test", STATE_ON),
+            SourceEntity(entity_id="light.test", domain="light", object_id="test", device_entry=child),
+        )
+        is None
+    )
+
+
+def test_exception_is_raised_when_invalid_sub_profile_matcher_supplied(
+    hass: HomeAssistant,
+) -> None:
+    power_profile = PowerProfile(
+        hass,
+        manufacturer="Foo",
+        model="Bar",
+        directory="",
+        json_data={
+            "sub_profile_select": {
+                "matchers": [{"type": "invalid_type"}],
+                "default": "henkie",
+            },
+        },
+    )
+    source_entity = SourceEntity(entity_id="light.test", domain="light", object_id="test")
+    with pytest.raises(PowercalcSetupError):
+        SubProfileSelector(hass, power_profile.sub_profile_select, source_entity)

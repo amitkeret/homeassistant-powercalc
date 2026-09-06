@@ -1,0 +1,16 @@
+rules:
+  dangerous-triggers:
+    ignore:
+      # These workflows intentionally use workflow_run to keep untrusted PR jobs
+      # read-only, then perform privileged PR commenting from trusted workflow code.
+      - comment-merged-power-profile.yml
+      - pr-comment-upload-and-comment.yml
+      - validate-model-json-comment.yml
+  self-repository:
+    # The $/ syntax downloads the whole repository as an action, but the
+    # intentional cyclic symlink used by the test integration cannot be extracted.
+    ignore:
+      - pr-comment-upload-and-comment.yml
+      - publish-measure-image.yml
+      - test-measure.yml
+      - validate-model-json-comment.yml

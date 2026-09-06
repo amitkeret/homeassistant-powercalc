@@ -20,15 +20,20 @@ from custom_components.powercalc.const import (
     CalculationStrategy,
     SensorType,
 )
-from tests.common import assert_entity_state, run_powercalc_setup, set_states
+from tests.common import (
+    assert_entity_state,
+    create_mock_config_entry,
+    mock_device_with_entities,
+    run_powercalc_setup,
+    set_states,
+)
 from tests.config_flow.common import (
     DEFAULT_UNIQUE_ID,
     confirm_auto_discovered_model,
-    create_mock_entry,
+    handle_options_flow_update,
     initialize_options_flow,
     select_menu_item,
 )
-from tests.conftest import MockEntityWithModel
 
 
 @pytest.mark.parametrize(
@@ -42,13 +47,13 @@ from tests.conftest import MockEntityWithModel
 )
 async def test_smart_switch_flow(
     hass: HomeAssistant,
-    mock_entity_with_model_information: MockEntityWithModel,
     user_input: dict[str, Any],
     expected_fixed_power: float,
 ) -> None:
     await run_powercalc_setup(hass)
 
-    mock_entity_with_model_information(
+    mock_device_with_entities(
+        hass,
         "switch.test",
         "test",
         "smart_switch_without_pm",
@@ -95,7 +100,7 @@ async def test_smart_switch_flow(
 
 
 async def test_smart_switch_options(hass: HomeAssistant) -> None:
-    entry = create_mock_entry(
+    entry = await create_mock_config_entry(
         hass,
         {
             CONF_ENTITY_ID: "switch.test",
@@ -108,20 +113,13 @@ async def test_smart_switch_options(hass: HomeAssistant) -> None:
         },
     )
 
-    result = await initialize_options_flow(hass, entry, Step.FIXED)
+    await handle_options_flow_update(hass, entry, Step.FIXED, {CONF_SELF_USAGE_INCLUDED: True})
 
-    user_input = {CONF_SELF_USAGE_INCLUDED: True}
-    result = await hass.config_entries.options.async_configure(
-        result["flow_id"],
-        user_input=user_input,
-    )
-
-    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
     assert entry.data[CONF_SELF_USAGE_INCLUDED] is True
 
 
 async def test_smart_switch_options_correctly_loaded(hass: HomeAssistant) -> None:
-    entry = create_mock_entry(
+    entry = await create_mock_config_entry(
         hass,
         {
             CONF_ENTITY_ID: "switch.test",

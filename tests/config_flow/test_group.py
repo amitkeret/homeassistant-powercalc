@@ -8,19 +8,18 @@ from homeassistant.const import (
     CONF_ENTITY_ID,
     CONF_NAME,
     CONF_SENSOR_TYPE,
+    STATE_ON,
     Platform,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.area_registry import AreaRegistry
-from homeassistant.helpers.device_registry import DeviceEntry
-from homeassistant.helpers.entity_registry import EntityRegistry
 from homeassistant.helpers.floor_registry import FloorRegistry
 from homeassistant.helpers.selector import SelectSelector
-from pytest_homeassistant_custom_component.common import MockConfigEntry, RegistryEntryWithDefaults, mock_device_registry, mock_registry
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 import voluptuous as vol
 
-from custom_components.powercalc import SensorType, async_migrate_entry
-from custom_components.powercalc.config_flow import PowercalcConfigFlow, Step
+from custom_components.powercalc import SensorType
+from custom_components.powercalc.config_flow import Step
 from custom_components.powercalc.const import (
     ATTR_ENTITIES,
     CONF_AREA,
@@ -53,33 +52,40 @@ from custom_components.powercalc.const import (
     CalculationStrategy,
     GroupType,
 )
+from custom_components.powercalc.flow_helper.flows.group import SECTION_GROUP_MEMBERS, SECTION_GROUP_OPTIONS
 from custom_components.powercalc.sensors.group.config_entry_utils import add_to_associated_groups
-from custom_components.test.light import MockLight
 from tests.common import (
-    create_mock_light_entity,
+    assert_entity_state,
+    create_mock_config_entry,
+    create_mock_group_entry,
     create_mocked_virtual_power_sensor_entry,
+    migrate_legacy_entry,
+    mock_device,
+    mock_entities_in_registry,
     run_powercalc_setup,
     set_states,
-    setup_config_entry,
 )
 from tests.config_flow.common import (
-    create_mock_entry,
+    fixed_value_choice,
     goto_virtual_power_strategy_step,
+    handle_options_flow_update,
     initialize_options_flow,
+    section_schema,
     select_menu_item,
     set_virtual_power_configuration,
+    submit_form_step,
 )
 
 
 async def test_create_group_entry(hass: HomeAssistant) -> None:
     result = await select_menu_item(hass, Step.MENU_GROUP, Step.GROUP_CUSTOM)
-    user_input = {
-        CONF_NAME: "My group sensor",
-        CONF_GROUP_POWER_ENTITIES: ["sensor.balcony_power", "sensor.bedroom1_power"],
-    }
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"],
-        user_input,
+    result = await submit_form_step(
+        hass,
+        result,
+        {
+            CONF_NAME: "My group sensor",
+            CONF_GROUP_POWER_ENTITIES: ["sensor.balcony_power", "sensor.bedroom1_power"],
+        },
     )
     assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
     assert result["data"] == {
@@ -100,13 +106,13 @@ async def test_create_group_entry(hass: HomeAssistant) -> None:
 
 async def test_create_group_entry_without_unique_id(hass: HomeAssistant) -> None:
     result = await select_menu_item(hass, Step.MENU_GROUP, Step.GROUP_CUSTOM)
-    user_input = {
-        CONF_NAME: "My group sensor",
-        CONF_GROUP_POWER_ENTITIES: ["sensor.balcony_power"],
-    }
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"],
-        user_input,
+    result = await submit_form_step(
+        hass,
+        result,
+        {
+            CONF_NAME: "My group sensor",
+            CONF_GROUP_POWER_ENTITIES: ["sensor.balcony_power"],
+        },
     )
     assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
     assert result["data"] == {
@@ -134,15 +140,15 @@ async def test_create_energy_sensor_enabled(hass: HomeAssistant) -> None:
     await run_powercalc_setup(hass, {}, {CONF_CREATE_ENERGY_SENSORS: False})
 
     result = await select_menu_item(hass, Step.MENU_GROUP, Step.GROUP_CUSTOM)
-    user_input = {
-        CONF_NAME: "My group sensor",
-        CONF_GROUP_POWER_ENTITIES: ["sensor.balcony_power"],
-        CONF_GROUP_ENERGY_ENTITIES: ["sensor.balcony_energy"],
-        CONF_CREATE_ENERGY_SENSOR: True,
-    }
-    await hass.config_entries.flow.async_configure(
-        result["flow_id"],
-        user_input,
+    await submit_form_step(
+        hass,
+        result,
+        {
+            CONF_NAME: "My group sensor",
+            CONF_GROUP_POWER_ENTITIES: ["sensor.balcony_power"],
+            CONF_GROUP_ENERGY_ENTITIES: ["sensor.balcony_energy"],
+            CONF_CREATE_ENERGY_SENSOR: True,
+        },
     )
 
     await hass.async_block_till_done()
@@ -151,46 +157,24 @@ async def test_create_energy_sensor_enabled(hass: HomeAssistant) -> None:
 
 
 async def test_add_device_members_to_group(hass: HomeAssistant) -> None:
-    mock_device_registry(
-        hass,
-        {
-            "my-device": DeviceEntry(
-                id="my-device",
-                name="My device",
-                manufacturer="Mock",
-                model="Device",
-            ),
-        },
-    )
+    mock_device(hass, "my-device", "Mock", "Device", name="My device")
 
-    mock_registry(
+    mock_entities_in_registry(
         hass,
         {
-            "sensor.balcony_power": RegistryEntryWithDefaults(
-                entity_id="sensor.balcony_power",
-                unique_id="1111",
-                platform="sensor",
-                device_class=SensorDeviceClass.POWER,
-                device_id="my-device",
-            ),
-            "sensor.balcony_energy": RegistryEntryWithDefaults(
-                entity_id="sensor.balcony_energy",
-                unique_id="2222",
-                platform="sensor",
-                device_class=SensorDeviceClass.ENERGY,
-                device_id="my-device",
-            ),
+            "sensor.balcony_power": {"device_class": SensorDeviceClass.POWER, "device_id": "my-device"},
+            "sensor.balcony_energy": {"device_class": SensorDeviceClass.ENERGY, "device_id": "my-device"},
         },
     )
 
     result = await select_menu_item(hass, Step.MENU_GROUP, Step.GROUP_CUSTOM)
-    user_input = {
-        CONF_NAME: "My group sensor",
-        CONF_GROUP_MEMBER_DEVICES: ["my-device"],
-    }
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"],
-        user_input,
+    result = await submit_form_step(
+        hass,
+        result,
+        {
+            CONF_NAME: "My group sensor",
+            CONF_GROUP_MEMBER_DEVICES: ["my-device"],
+        },
     )
     assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
     assert result["data"] == {
@@ -207,25 +191,19 @@ async def test_add_device_members_to_group(hass: HomeAssistant) -> None:
     }
 
     await set_states(hass, [("sensor.balcony_power", 5), ("sensor.balcony_energy", 5)])
-    power_state = hass.states.get("sensor.my_group_sensor_power")
-    assert power_state
-    assert power_state.attributes.get(CONF_ENTITIES) == {"sensor.balcony_power"}
+    assert_entity_state(hass, "sensor.my_group_sensor_power", attributes={CONF_ENTITIES: {"sensor.balcony_power"}})
 
-    energy_state = hass.states.get("sensor.my_group_sensor_energy")
-    assert energy_state
-    assert energy_state.attributes.get(CONF_ENTITIES) == {"sensor.balcony_energy"}
+    assert_entity_state(hass, "sensor.my_group_sensor_energy", attributes={CONF_ENTITIES: {"sensor.balcony_energy"}})
 
 
 async def test_group_include_area(
     hass: HomeAssistant,
-    entity_registry: EntityRegistry,
     area_registry: AreaRegistry,
 ) -> None:
     # Create light entity and add to group My area
-    light = MockLight("test")
-    await create_mock_light_entity(hass, light)
     area = area_registry.async_get_or_create("My area")
-    entity_registry.async_update_entity(light.entity_id, area_id=area.id)
+    mock_entities_in_registry(hass, {"light.test": {"area_id": area.id}})
+    await set_states(hass, [("light.test", STATE_ON)])
 
     result = await goto_virtual_power_strategy_step(
         hass,
@@ -235,18 +213,18 @@ async def test_group_include_area(
     await set_virtual_power_configuration(
         hass,
         result,
-        {CONF_STATES_POWER: {"playing": 1.8}},
+        fixed_value_choice(CONF_STATES_POWER, [{"state": "playing", "power": 1.8}]),
     )
 
     result = await select_menu_item(hass, Step.MENU_GROUP, Step.GROUP_CUSTOM)
-    user_input = {
-        CONF_NAME: "My group sensor",
-        CONF_AREA: area.id,
-        CONF_CREATE_UTILITY_METERS: True,
-    }
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"],
-        user_input,
+    result = await submit_form_step(
+        hass,
+        result,
+        {
+            CONF_NAME: "My group sensor",
+            CONF_AREA: area.id,
+            CONF_CREATE_UTILITY_METERS: True,
+        },
     )
 
     # Submit utility_meter_options step with default settings
@@ -276,9 +254,7 @@ async def test_group_include_area(
     }
 
     await set_states(hass, [("sensor.test_power", 5)])
-    power_state = hass.states.get("sensor.my_group_sensor_power")
-    assert power_state
-    assert power_state.attributes.get(CONF_ENTITIES) == {"sensor.test_power"}
+    assert_entity_state(hass, "sensor.my_group_sensor_power", attributes={CONF_ENTITIES: {"sensor.test_power"}})
 
     energy_state = hass.states.get("sensor.my_group_sensor_energy")
     assert energy_state
@@ -297,52 +273,41 @@ async def test_group_include_floor(
     area = area_registry.async_get_or_create("My area")
     area_registry.async_update(area.id, floor_id=floor.floor_id)
 
-    mock_registry(
+    mock_entities_in_registry(
         hass,
         {
-            "sensor.test_power": RegistryEntryWithDefaults(
-                entity_id="sensor.test_power",
-                unique_id="1111",
-                platform="sensor",
-                device_class=SensorDeviceClass.POWER,
-                area_id=area.id,
-            ),
+            "sensor.test_power": {"device_class": SensorDeviceClass.POWER, "area_id": area.id},
         },
     )
 
     result = await select_menu_item(hass, Step.MENU_GROUP, Step.GROUP_CUSTOM)
-    user_input = {
-        CONF_NAME: "My floor group",
-        CONF_CREATE_ENERGY_SENSOR: False,
-        CONF_FLOOR: floor.floor_id,
-    }
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"],
-        user_input,
+    result = await submit_form_step(
+        hass,
+        result,
+        {
+            CONF_NAME: "My floor group",
+            CONF_CREATE_ENERGY_SENSOR: False,
+            CONF_FLOOR: floor.floor_id,
+        },
     )
 
     assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
     assert result["data"][CONF_FLOOR] == floor.floor_id
 
     await set_states(hass, [("sensor.test_power", 5)])
-    power_state = hass.states.get("sensor.my_floor_group_power")
-    assert power_state
-    assert power_state.attributes.get(CONF_ENTITIES) == {"sensor.test_power"}
+    assert_entity_state(hass, "sensor.my_floor_group_power", attributes={CONF_ENTITIES: {"sensor.test_power"}})
 
 
 async def test_can_unset_area(hass: HomeAssistant, area_registry: AreaRegistry) -> None:
     area_registry.async_get_or_create("My area")
-    config_entry = MockConfigEntry(
-        domain=DOMAIN,
-        unique_id="abcdefg",
-        data={
-            CONF_SENSOR_TYPE: SensorType.GROUP,
-            CONF_NAME: "TestArea",
+    config_entry = await create_mock_group_entry(
+        hass,
+        "TestArea",
+        {
             CONF_AREA: "My area",
         },
-        title="TestArea",
+        setup=False,
     )
-    config_entry.add_to_hass(hass)
 
     updated_entry = hass.config_entries.async_get_entry(config_entry.entry_id)
     assert updated_entry.data == {
@@ -351,13 +316,7 @@ async def test_can_unset_area(hass: HomeAssistant, area_registry: AreaRegistry) 
         CONF_AREA: "My area",
     }
 
-    result = await initialize_options_flow(hass, config_entry, Step.GROUP_CUSTOM)
-
-    user_input = {}
-    await hass.config_entries.options.async_configure(
-        result["flow_id"],
-        user_input=user_input,
-    )
+    await handle_options_flow_update(hass, config_entry, Step.GROUP_CUSTOM, {})
     updated_entry = hass.config_entries.async_get_entry(config_entry.entry_id)
     assert updated_entry.data == {
         ENTRY_DATA_ENERGY_ENTITY: "sensor.testarea_energy",
@@ -375,45 +334,35 @@ async def test_include_area_powercalc_only(
     area_registry: AreaRegistry,
 ) -> None:
     area = area_registry.async_get_or_create("My area")
-    mock_registry(
+    mock_entities_in_registry(
         hass,
         {
-            "switch.switch": RegistryEntryWithDefaults(
-                entity_id="switch.switch",
-                unique_id="1111",
-                platform="switch",
-                area_id=area.id,
-            ),
-            "sensor.existing_power": RegistryEntryWithDefaults(
-                entity_id="sensor.existing_power",
-                unique_id="3333",
-                platform="sensor",
-                device_class=SensorDeviceClass.POWER,
-                area_id=area.id,
-            ),
+            "switch.switch": {"area_id": area.id},
+            "sensor.existing_power": {"device_class": SensorDeviceClass.POWER, "area_id": area.id},
         },
     )
 
-    await setup_config_entry(hass, {CONF_ENTITY_ID: "switch.switch", CONF_NAME: "Test", CONF_FIXED: {CONF_POWER: 5}})
+    await create_mock_config_entry(
+        hass,
+        {CONF_ENTITY_ID: "switch.switch", CONF_NAME: "Test", CONF_FIXED: {CONF_POWER: 5}},
+    )
 
     result = await select_menu_item(hass, Step.MENU_GROUP, Step.GROUP_CUSTOM)
-    user_input = {
-        CONF_NAME: "My group sensor",
-        CONF_AREA: area.id,
-        CONF_INCLUDE_NON_POWERCALC_SENSORS: False,
-        CONF_CREATE_UTILITY_METERS: False,
-    }
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"],
-        user_input,
+    result = await submit_form_step(
+        hass,
+        result,
+        {
+            CONF_NAME: "My group sensor",
+            CONF_AREA: area.id,
+            CONF_INCLUDE_NON_POWERCALC_SENSORS: False,
+            CONF_CREATE_UTILITY_METERS: False,
+        },
     )
     assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
     assert not result["data"][CONF_INCLUDE_NON_POWERCALC_SENSORS]
 
     await set_states(hass, [("sensor.test_power", 5)])
-    power_state = hass.states.get("sensor.my_group_sensor_power")
-    assert power_state
-    assert power_state.attributes.get(CONF_ENTITIES) == {"sensor.test_power"}
+    assert_entity_state(hass, "sensor.my_group_sensor_power", attributes={CONF_ENTITIES: {"sensor.test_power"}})
 
 
 async def test_can_select_existing_powercalc_entry_as_group_member(
@@ -442,20 +391,20 @@ async def test_can_select_existing_powercalc_entry_as_group_member(
     result = await select_menu_item(hass, Step.MENU_GROUP, Step.GROUP_CUSTOM)
     assert result["type"] == data_entry_flow.FlowResultType.FORM
     data_schema: vol.Schema = result["data_schema"]
-    select: SelectSelector = data_schema.schema[CONF_GROUP_MEMBER_SENSORS]
+    select: SelectSelector = section_schema(data_schema, SECTION_GROUP_MEMBERS).schema[CONF_GROUP_MEMBER_SENSORS]
     options = select.config["options"]
     assert len(options) == 2
     assert {"value": config_entry_1.entry_id, "label": "VirtualPower1"} in options
     assert {"value": config_entry_2.entry_id, "label": "VirtualPower2"} in options
     assert {"value": config_entry_3.entry_id, "label": "VirtualPower3"} not in options
 
-    user_input = {
-        CONF_NAME: "My group sensor",
-        CONF_GROUP_MEMBER_SENSORS: [config_entry_1.entry_id],
-    }
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"],
-        user_input,
+    result = await submit_form_step(
+        hass,
+        result,
+        {
+            CONF_NAME: "My group sensor",
+            CONF_GROUP_MEMBER_SENSORS: [config_entry_1.entry_id],
+        },
     )
 
     assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
@@ -486,7 +435,7 @@ async def test_real_power_entry_selectable_as_group_member(
         "VirtualPower1",
         "abcdef",
     )
-    config_entry_2 = await setup_config_entry(
+    config_entry_2 = await create_mock_config_entry(
         hass,
         {
             CONF_SENSOR_TYPE: SensorType.REAL_POWER,
@@ -498,35 +447,33 @@ async def test_real_power_entry_selectable_as_group_member(
     result = await select_menu_item(hass, Step.MENU_GROUP, Step.GROUP_CUSTOM)
     assert result["type"] == data_entry_flow.FlowResultType.FORM
     data_schema: vol.Schema = result["data_schema"]
-    select: SelectSelector = data_schema.schema[CONF_GROUP_MEMBER_SENSORS]
+    select: SelectSelector = section_schema(data_schema, SECTION_GROUP_MEMBERS).schema[CONF_GROUP_MEMBER_SENSORS]
     options = select.config["options"]
     assert len(options) == 2
     assert {"value": config_entry_1.entry_id, "label": "VirtualPower1"} in options
     assert {"value": config_entry_2.entry_id, "label": "RealPower1"} in options
 
-    user_input = {
-        CONF_NAME: "My group sensor",
-        CONF_GROUP_MEMBER_SENSORS: [config_entry_1.entry_id, config_entry_2.entry_id],
-    }
-    await hass.config_entries.flow.async_configure(
-        result["flow_id"],
-        user_input,
+    await submit_form_step(
+        hass,
+        result,
+        {
+            CONF_NAME: "My group sensor",
+            CONF_GROUP_MEMBER_SENSORS: [config_entry_1.entry_id, config_entry_2.entry_id],
+        },
     )
 
     await set_states(hass, [("sensor.real_power", "25.00")])
-    group_state = hass.states.get("sensor.my_group_sensor_power")
-    assert group_state.attributes.get(ATTR_ENTITIES) == {"sensor.virtualpower1_power", "sensor.real_power"}
-    assert group_state
-    assert group_state.state == "75.00"
+    assert_entity_state(
+        hass,
+        "sensor.my_group_sensor_power",
+        "75.00",
+        attributes={ATTR_ENTITIES: {"sensor.virtualpower1_power", "sensor.real_power"}},
+    )
 
 
 async def test_group_error_mandatory(hass: HomeAssistant) -> None:
     result = await select_menu_item(hass, Step.MENU_GROUP, Step.GROUP_CUSTOM)
-    user_input = {CONF_NAME: "My group sensor"}
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"],
-        user_input,
-    )
+    result = await submit_form_step(hass, result, {CONF_NAME: "My group sensor"})
     assert result["type"] == data_entry_flow.FlowResultType.FORM
     assert result["errors"]
     assert result["errors"]["base"] == "group_mandatory"
@@ -534,7 +481,7 @@ async def test_group_error_mandatory(hass: HomeAssistant) -> None:
 
 async def test_subgroup_selector(hass: HomeAssistant) -> None:
     # Create two existing group config entries
-    group1_entry = create_mock_entry(
+    group1_entry = await create_mock_config_entry(
         hass,
         {
             CONF_NAME: "Group1",
@@ -542,14 +489,14 @@ async def test_subgroup_selector(hass: HomeAssistant) -> None:
             CONF_GROUP_TYPE: GroupType.CUSTOM,
         },
     )
-    group2_entry = create_mock_entry(
+    group2_entry = await create_mock_config_entry(
         hass,
         {
             CONF_NAME: "Group2",
             CONF_SENSOR_TYPE: SensorType.GROUP,
         },
     )
-    create_mock_entry(
+    await create_mock_config_entry(
         hass,
         {
             CONF_NAME: "Group3",
@@ -563,7 +510,7 @@ async def test_subgroup_selector(hass: HomeAssistant) -> None:
 
     # Assert the two existing groups can be selected as subgroup
     data_schema: vol.Schema = result["data_schema"]
-    sub_group_selector: SelectSelector = data_schema.schema[CONF_SUB_GROUPS]
+    sub_group_selector: SelectSelector = section_schema(data_schema, SECTION_GROUP_MEMBERS).schema[CONF_SUB_GROUPS]
     options = sub_group_selector.config["options"]
     assert options == [
         {"label": "Group1", "value": group1_entry.entry_id},
@@ -571,8 +518,9 @@ async def test_subgroup_selector(hass: HomeAssistant) -> None:
     ]
 
     # Create the new group
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"],
+    result = await submit_form_step(
+        hass,
+        result,
         {
             CONF_NAME: "Group3",
             CONF_SUB_GROUPS: [group1_entry.entry_id, group2_entry.entry_id],
@@ -585,7 +533,7 @@ async def test_subgroup_selector(hass: HomeAssistant) -> None:
 
     # Assert that the group itself is not selectable as subgroup
     data_schema: vol.Schema = result["data_schema"]
-    sub_group_selector: SelectSelector = data_schema.schema[CONF_SUB_GROUPS]
+    sub_group_selector: SelectSelector = section_schema(data_schema, SECTION_GROUP_MEMBERS).schema[CONF_SUB_GROUPS]
     options = sub_group_selector.config["options"]
     assert options == [
         {"label": "Group1", "value": group1_entry.entry_id},
@@ -594,7 +542,7 @@ async def test_subgroup_selector(hass: HomeAssistant) -> None:
 
 
 async def test_group_options_flow(hass: HomeAssistant) -> None:
-    entry = create_mock_entry(
+    entry = await create_mock_config_entry(
         hass,
         {
             CONF_NAME: "Kitchen",
@@ -604,24 +552,11 @@ async def test_group_options_flow(hass: HomeAssistant) -> None:
         },
     )
 
-    result = await initialize_options_flow(hass, entry, Step.BASIC_OPTIONS)
-    await hass.config_entries.options.async_configure(
-        result["flow_id"],
-        user_input={CONF_CREATE_UTILITY_METERS: True},
-    )
-
-    result = await initialize_options_flow(hass, entry, Step.GROUP_CUSTOM)
+    await handle_options_flow_update(hass, entry, Step.BASIC_OPTIONS, {CONF_CREATE_UTILITY_METERS: True})
 
     new_entities = ["sensor.fridge_power", "sensor.kitchen_lights_power"]
-    user_input = {CONF_GROUP_POWER_ENTITIES: new_entities}
-    result = await hass.config_entries.options.async_configure(
-        result["flow_id"],
-        user_input=user_input,
-    )
+    await handle_options_flow_update(hass, entry, Step.GROUP_CUSTOM, {CONF_GROUP_POWER_ENTITIES: new_entities})
 
-    await hass.async_block_till_done()
-
-    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
     assert entry.data[CONF_GROUP_POWER_ENTITIES] == new_entities
     assert entry.data[CONF_CREATE_UTILITY_METERS]
 
@@ -633,32 +568,26 @@ async def test_field_defaults_from_global_powercalc_config(hass: HomeAssistant) 
     result = await select_menu_item(hass, Step.MENU_GROUP, Step.GROUP_CUSTOM)
 
     assert result["type"] == data_entry_flow.FlowResultType.FORM
-    schema_keys: list[vol.Optional] = list(result["data_schema"].schema.keys())
+    options_schema = section_schema(result["data_schema"], SECTION_GROUP_OPTIONS)
+    schema_keys: list[vol.Optional] = list(options_schema.schema.keys())
     assert not schema_keys[schema_keys.index(CONF_INCLUDE_NON_POWERCALC_SENSORS)].default()
 
 
 async def test_migrate_config_entry_from_version_2(hass: HomeAssistant) -> None:
     """Test migration of a group sensor entry to version 3. Should add `create_energy_sensor` field."""
-    mock_entry = MockConfigEntry(domain=DOMAIN, data={CONF_SENSOR_TYPE: SensorType.GROUP}, version=2)
-    mock_entry.add_to_hass(hass)
-    await async_migrate_entry(hass, mock_entry)
-    hass.config_entries.async_get_entry(mock_entry.entry_id)
-    assert mock_entry.version == PowercalcConfigFlow.VERSION
+    mock_entry = await migrate_legacy_entry(hass, {CONF_SENSOR_TYPE: SensorType.GROUP}, version=2)
     assert mock_entry.data.get(CONF_CREATE_ENERGY_SENSOR)
 
 
 async def test_create_group_on_demand_from_virtual_power_flow(hass: HomeAssistant) -> None:
-    config_entry = MockConfigEntry(
-        domain=DOMAIN,
-        unique_id="abcdefg",
-        data={
-            CONF_SENSOR_TYPE: SensorType.GROUP,
-            CONF_NAME: "TestGroup",
+    await create_mock_group_entry(
+        hass,
+        "TestGroup",
+        {
             CONF_GROUP_TYPE: GroupType.CUSTOM,
         },
-        title="TestGroup",
+        setup=False,
     )
-    config_entry.add_to_hass(hass)
 
     result = await goto_virtual_power_strategy_step(
         hass,
@@ -671,7 +600,7 @@ async def test_create_group_on_demand_from_virtual_power_flow(hass: HomeAssistan
     result = await set_virtual_power_configuration(
         hass,
         result,
-        {CONF_POWER: 20},
+        fixed_value_choice(CONF_POWER, 20),
         group_options={CONF_NEW_GROUP: "New group"},
     )
 
@@ -694,7 +623,7 @@ async def test_no_group_created_when_group_null(hass: HomeAssistant) -> None:
     Prevent regression by checking if the group field is null and not creating a group in that case.
     See https://github.com/bramstroker/homeassistant-powercalc/issues/2281
     """
-    await setup_config_entry(
+    await create_mock_config_entry(
         hass,
         {
             CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,

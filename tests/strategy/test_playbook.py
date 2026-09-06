@@ -1,5 +1,3 @@
-from datetime import timedelta
-
 from homeassistant.const import (
     ATTR_ENTITY_ID,
     CONF_ENTITY_ID,
@@ -11,10 +9,8 @@ from homeassistant.const import (
     STATE_PLAYING,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
-from homeassistant.util import dt
+from homeassistant.exceptions import ServiceValidationError
 import pytest
-from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
 from custom_components.powercalc import CONF_IGNORE_UNAVAILABLE_STATE
 from custom_components.powercalc.const import (
@@ -36,6 +32,7 @@ from custom_components.powercalc.errors import StrategyConfigurationError
 from custom_components.powercalc.strategy.playbook import PlaybookStrategy
 from tests.common import (
     assert_entity_state,
+    async_advance_time,
     get_simple_fixed_config,
     get_test_profile_dir,
     run_powercalc_setup,
@@ -155,8 +152,9 @@ async def test_services_raises_error_on_non_playbook_sensor(
         get_simple_fixed_config("switch.test"),
     )
     await set_states(hass, [("switch.test", STATE_ON)])
-    with pytest.raises(HomeAssistantError):
+    with pytest.raises(ServiceValidationError) as exc_info:
         await _activate_playbook(hass, "playbook1")
+    assert exc_info.value.translation_key == "not_a_playbook_sensor"
 
 
 async def test_stop_service_raises_error_on_non_playbook_sensor(
@@ -167,7 +165,7 @@ async def test_stop_service_raises_error_on_non_playbook_sensor(
         get_simple_fixed_config("switch.test"),
     )
     await set_states(hass, [("switch.test", STATE_ON)])
-    with pytest.raises(HomeAssistantError):
+    with pytest.raises(ServiceValidationError):
         await _stop_playbook(hass)
 
 
@@ -179,7 +177,7 @@ async def test_get_active_playbook_raises_error_on_non_playbook_sensor(
         get_simple_fixed_config("switch.test"),
     )
     await set_states(hass, [("switch.test", STATE_ON)])
-    with pytest.raises(HomeAssistantError):
+    with pytest.raises(ServiceValidationError):
         await _get_active_playbook(hass)
 
 
@@ -322,7 +320,7 @@ async def test_source_entity_trigger(hass: HomeAssistant) -> None:
     await elapse_and_assert_power(hass, 2, "20.00")
 
     await set_states(hass, [("switch.test", STATE_OFF)])
-    async_fire_time_changed(hass, dt.utcnow() + timedelta(seconds=60))
+    await async_advance_time(hass, 60, block=False)
 
     await set_states(hass, [("switch.test", STATE_ON)])
     assert_entity_state(hass, POWER_SENSOR_ID, "0.00")
@@ -387,7 +385,7 @@ async def elapse_and_assert_power(
     seconds: float,
     expected_power: str,
 ) -> None:
-    async_fire_time_changed(hass, dt.utcnow() + timedelta(seconds=seconds))
+    await async_advance_time(hass, seconds, block=False)
 
     assert_entity_state(hass, POWER_SENSOR_ID, expected_power)
 

@@ -1,27 +1,45 @@
+import asyncio
+from collections.abc import AsyncIterator
 import contextlib
 from functools import partial
 import json
 import logging
 import os
+from pathlib import Path
 import re
 import shutil
+from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, Mock, patch
 
-from aiohttp import ClientError
+from aiohttp import ClientError, ClientResponse
 from aioresponses import aioresponses
 from awesomeversion import AwesomeVersion
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import STORAGE_DIR
 import pytest
 
+from custom_components.powercalc.const import LIBRARY_DISCOVERY_LOW_PRIORITY_DOMAINS
 from custom_components.powercalc.helpers import get_library_json_path, get_library_path
 from custom_components.powercalc.power_profile.error import LibraryLoadingError, ProfileDownloadError
 from custom_components.powercalc.power_profile.library import ModelInfo, ProfileLibrary
-from custom_components.powercalc.power_profile.loader.remote import ENDPOINT_DOWNLOAD, ENDPOINT_LIBRARY, RemoteLoader
+from custom_components.powercalc.power_profile.loader.remote import (
+    ENDPOINT_DOWNLOAD,
+    ENDPOINT_LIBRARY,
+    LibraryModel,
+    RemoteLoader,
+    _read_capped,
+    _save_resource,
+    _validate_library_contents,
+)
 from custom_components.powercalc.power_profile.power_profile import DeviceType, DiscoveryBy
 from tests.common import get_test_config_dir, get_test_profile_dir
 
 pytestmark = pytest.mark.skip_remote_loader_mocking
+
+LIBRARY_URL_PREFIX = "https://raw.githubusercontent.com/bramstroker/homeassistant-powercalc/master/profile_library"
+LIBRARY_RESOURCE_URL = f"{LIBRARY_URL_PREFIX}/test/model/model.json"
+LIBRARY_CSV_RESOURCE_URL = f"{LIBRARY_URL_PREFIX}/test/model/data.csv.gz"
 
 
 @pytest.fixture
@@ -52,7 +70,7 @@ async def remote_loader(hass: HomeAssistant, mock_library_json_response: None) -
 
 
 @pytest.fixture
-async def mock_download_profile_endpoints(mock_aioresponse: aioresponses) -> list[dict]:
+def mock_download_profile_endpoints(mock_aioresponse: aioresponses) -> list[dict]:
     remote_files = [
         {
             "path": "color_temp.csv.gz",
@@ -86,22 +104,98 @@ async def mock_download_profile_endpoints(mock_aioresponse: aioresponses) -> lis
     return remote_files
 
 
-async def test_download(mock_aioresponse: aioresponses, remote_loader: RemoteLoader, mock_download_profile_endpoints: list[dict]) -> None:
+async def test_download(
+    mock_aioresponse: aioresponses,
+    remote_loader: RemoteLoader,
+    mock_download_profile_endpoints: list[dict],
+    tmp_path: Path,
+) -> None:
     """Mock the API response for the download of a profile."""
     remote_files = mock_download_profile_endpoints
 
-    storage_dir = get_test_profile_dir("download")
+    storage_dir = str(tmp_path / "download")
     await remote_loader.download_profile("signify", "LCA001", storage_dir, "test_download")
 
     for remote_file in remote_files:
-        assert os.path.exists(os.path.join(storage_dir, remote_file["path"]))
+        assert await remote_loader.hass.async_add_executor_job(
+            os.path.exists,
+            os.path.join(storage_dir, remote_file["path"]),
+        )
 
 
-async def test_download_with_parenthesis(remote_loader: RemoteLoader, mock_aioresponse: aioresponses) -> None:
+async def test_download_keeps_existing_resources_when_a_later_download_fails(
+    remote_loader: RemoteLoader,
+    mock_aioresponse: aioresponses,
+    tmp_path: Path,
+) -> None:
+    """Do not partially update a cached profile when one of its resources cannot be downloaded."""
+    storage_path = tmp_path / "profiles"
+    storage_path.mkdir()
+    existing_resource = storage_path / "model.json"
+    existing_resource.write_bytes(b'{"existing": true}')
+    resources = [
+        {
+            "path": "model.json",
+            "url": LIBRARY_RESOURCE_URL,
+        },
+        {
+            "path": "data.csv.gz",
+            "url": LIBRARY_CSV_RESOURCE_URL,
+        },
+    ]
+    mock_aioresponse.get(
+        f"{ENDPOINT_DOWNLOAD}/test/model?hash=test_download",
+        status=200,
+        payload=resources,
+    )
+    mock_aioresponse.get(resources[0]["url"], status=200, body=b'{"new": true}')
+    mock_aioresponse.get(resources[1]["url"], status=500)
+
+    with pytest.raises(ProfileDownloadError, match="Failed to download github URL"):
+        await remote_loader.download_profile("test", "model", str(storage_path), "test_download")
+
+    assert existing_resource.read_bytes() == b'{"existing": true}'
+
+
+def test_save_resource_flushes_to_disk_before_renaming(tmp_path: Path) -> None:
+    """The contents must reach the disk before the rename, so a power loss cannot expose an empty file."""
+    destination = tmp_path / "model.json"
+    destination.write_bytes(b'{"existing": true}')
+    call_order: list[str] = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def _record_fsync(fd: int) -> None:
+        call_order.append("fsync")
+        real_fsync(fd)
+
+    def _record_replace(source: object, target: object) -> None:
+        call_order.append("replace")
+        real_replace(cast(str, source), cast(str, target))
+
+    with (
+        patch("custom_components.powercalc.power_profile.loader.remote.os.fsync", side_effect=_record_fsync),
+        patch(
+            "custom_components.powercalc.power_profile.loader.remote.os.replace",
+            side_effect=_record_replace,
+        ),
+    ):
+        _save_resource(b'{"new": true}', destination)
+
+    assert destination.read_bytes() == b'{"new": true}'
+    assert call_order[: call_order.index("replace")] == ["fsync"]
+    assert not list(tmp_path.glob(".model.json.*"))
+
+
+async def test_download_with_parenthesis(
+    remote_loader: RemoteLoader,
+    mock_aioresponse: aioresponses,
+    tmp_path: Path,
+) -> None:
     remote_files = [
         {
             "path": "model.json",
-            "url": "https://raw.githubusercontent.com/bramstroker/homeassistant-powercalc/master/profile_library/google/Home Mini (HOA)/model.json",
+            "url": "https://raw.githubusercontent.com/bramstroker/homeassistant-powercalc/master/profile_library/google/H0A/model.json",
         },
     ]
 
@@ -113,7 +207,7 @@ async def test_download_with_parenthesis(remote_loader: RemoteLoader, mock_aiore
     )
 
     for remote_file in remote_files:
-        with open(get_library_path("google/Home Mini (HOA)") + f"/{remote_file['path']}", "rb") as f:
+        with open(get_library_path("google/H0A") + f"/{remote_file['path']}", "rb") as f:
             mock_aioresponse.get(
                 remote_file["url"],
                 status=200,
@@ -121,11 +215,389 @@ async def test_download_with_parenthesis(remote_loader: RemoteLoader, mock_aiore
                 repeat=True,
             )
 
-    storage_dir = get_test_profile_dir("download")
+    storage_dir = str(tmp_path / "download")
     await remote_loader.download_profile("google", "Home Mini (HOA)", storage_dir, "test_download")
 
     for remote_file in remote_files:
-        assert os.path.exists(os.path.join(storage_dir, remote_file["path"]))
+        assert await remote_loader.hass.async_add_executor_job(
+            os.path.exists,
+            os.path.join(storage_dir, remote_file["path"]),
+        )
+
+
+@pytest.mark.parametrize(
+    "resource_url",
+    [
+        "http://raw.githubusercontent.com/example/profile/model.json",
+        "https://example.com/profile/model.json",
+        "https://raw.githubusercontent.com.example.com/profile/model.json",
+        "https://github.com@127.0.0.1/profile/model.json",
+        "https://github.com:444/profile/model.json",
+        "https://github.com:invalid/profile/model.json",
+        # Allowed host, but outside the profile library of the Powercalc repository.
+        "https://raw.githubusercontent.com/attacker/evil/master/profile_library/test/model/model.json",
+        "https://raw.githubusercontent.com/bramstroker/homeassistant-powercalc/master/README.md",
+        "https://raw.githubusercontent.com/bramstroker/homeassistant-powercalc/master/profile_library/../../a/b/c.json",
+        "https://raw.githubusercontent.com/bramstroker/homeassistant-powercalc/master/profile_library/%2e%2e/%2e%2e/a/b.json",
+        None,
+    ],
+)
+async def test_download_rejects_untrusted_resource_url(
+    remote_loader: RemoteLoader,
+    mock_aioresponse: aioresponses,
+    tmp_path: Path,
+    resource_url: str | None,
+) -> None:
+    mock_aioresponse.get(
+        f"{ENDPOINT_DOWNLOAD}/test/model?hash=test_download",
+        status=200,
+        payload=[{"path": "model.json", "url": resource_url}],
+    )
+
+    with pytest.raises(ProfileDownloadError, match="URL"):
+        await remote_loader.download_profile("test", "model", str(tmp_path / "profiles"), "test_download")
+
+
+@pytest.mark.parametrize("resource_path", ["../outside.json", "nested/../../outside.json", "", None])
+async def test_download_rejects_invalid_resource_path(
+    remote_loader: RemoteLoader,
+    mock_aioresponse: aioresponses,
+    tmp_path: Path,
+    resource_path: str | None,
+) -> None:
+    mock_aioresponse.get(
+        f"{ENDPOINT_DOWNLOAD}/test/model?hash=test_download",
+        status=200,
+        payload=[
+            {
+                "path": resource_path,
+                "url": LIBRARY_RESOURCE_URL,
+            },
+        ],
+    )
+
+    with pytest.raises(ProfileDownloadError, match="path"):
+        await remote_loader.download_profile("test", "model", str(tmp_path / "profiles"), "test_download")
+
+
+async def test_download_rejects_invalid_storage_path(
+    remote_loader: RemoteLoader,
+    mock_aioresponse: aioresponses,
+) -> None:
+    mock_aioresponse.get(
+        f"{ENDPOINT_DOWNLOAD}/test/model?hash=test_download",
+        status=200,
+        payload=[
+            {
+                "path": "model.json",
+                "url": LIBRARY_RESOURCE_URL,
+            },
+        ],
+    )
+
+    with pytest.raises(ProfileDownloadError, match="invalid path"):
+        await remote_loader.download_profile("test", "model", "invalid\0path", "test_download")
+
+
+@pytest.mark.parametrize(
+    "manufacturer, model",
+    [
+        ("../outside", "model"),
+        ("test", "../outside"),
+        ("test/../../outside", "model"),
+        ("test", "model\\..\\outside"),
+    ],
+)
+def test_get_storage_path_rejects_unsafe_library_identifiers(
+    remote_loader: RemoteLoader,
+    manufacturer: str,
+    model: str,
+) -> None:
+    with pytest.raises(ProfileDownloadError, match="invalid"):
+        remote_loader.get_storage_path(manufacturer, model)
+
+
+def test_get_storage_path_rejects_symlink_escape(
+    remote_loader: RemoteLoader,
+    tmp_path: Path,
+) -> None:
+    storage_root = tmp_path / "profiles"
+    outside_path = tmp_path / "outside"
+    storage_root.mkdir()
+    outside_path.mkdir()
+    (storage_root / "linked").symlink_to(outside_path, target_is_directory=True)
+
+    with (
+        patch.object(remote_loader.hass.config, "path", return_value=str(storage_root)),
+        pytest.raises(ProfileDownloadError, match="outside"),
+    ):
+        remote_loader.get_storage_path("linked", "model")
+
+
+def test_get_storage_path_handles_resolution_error(
+    remote_loader: RemoteLoader,
+    tmp_path: Path,
+) -> None:
+    storage_root = tmp_path / "profiles"
+
+    with (
+        patch.object(remote_loader.hass.config, "path", return_value=str(storage_root)),
+        patch.object(Path, "resolve", side_effect=[storage_root, OSError("cannot resolve path")]),
+        pytest.raises(ProfileDownloadError, match="invalid storage path"),
+    ):
+        remote_loader.get_storage_path("test", "model")
+
+
+@pytest.mark.parametrize("resources", [{}, ["invalid"]])
+async def test_download_rejects_invalid_resource_manifest(
+    remote_loader: RemoteLoader,
+    mock_aioresponse: aioresponses,
+    tmp_path: Path,
+    resources: object,
+) -> None:
+    mock_aioresponse.get(
+        f"{ENDPOINT_DOWNLOAD}/test/model?hash=test_download",
+        status=200,
+        payload=resources,
+    )
+
+    with pytest.raises(ProfileDownloadError, match="invalid resources"):
+        await remote_loader.download_profile("test", "model", str(tmp_path / "profiles"), "test_download")
+
+
+async def test_download_rejects_a_manifest_that_is_not_json(
+    remote_loader: RemoteLoader,
+    mock_aioresponse: aioresponses,
+    tmp_path: Path,
+) -> None:
+    """A manifest that is not JSON must surface as a download error rather than a decoding crash."""
+    mock_aioresponse.get(
+        f"{ENDPOINT_DOWNLOAD}/test/model?hash=test_download",
+        status=200,
+        body=b"<html>gateway error</html>",
+    )
+
+    with pytest.raises(ProfileDownloadError, match="not valid JSON"):
+        await remote_loader.download_profile("test", "model", str(tmp_path / "profiles"), "test_download")
+
+
+async def test_download_rejects_absolute_resource_path(
+    remote_loader: RemoteLoader,
+    mock_aioresponse: aioresponses,
+    tmp_path: Path,
+) -> None:
+    mock_aioresponse.get(
+        f"{ENDPOINT_DOWNLOAD}/test/model?hash=test_download",
+        status=200,
+        payload=[
+            {
+                "path": str(tmp_path / "outside.json"),
+                "url": LIBRARY_RESOURCE_URL,
+            },
+        ],
+    )
+
+    with pytest.raises(ProfileDownloadError, match="path"):
+        await remote_loader.download_profile("test", "model", str(tmp_path / "profiles"), "test_download")
+
+    assert not (tmp_path / "outside.json").exists()
+
+
+async def test_download_rejects_resource_path_through_symlink(
+    remote_loader: RemoteLoader,
+    mock_aioresponse: aioresponses,
+    tmp_path: Path,
+) -> None:
+    storage_path = tmp_path / "profiles"
+    outside_path = tmp_path / "outside"
+    storage_path.mkdir()
+    outside_path.mkdir()
+    (storage_path / "linked").symlink_to(outside_path, target_is_directory=True)
+    mock_aioresponse.get(
+        f"{ENDPOINT_DOWNLOAD}/test/model?hash=test_download",
+        status=200,
+        payload=[
+            {
+                "path": "linked/model.json",
+                "url": LIBRARY_RESOURCE_URL,
+            },
+        ],
+    )
+
+    with pytest.raises(ProfileDownloadError, match="path"):
+        await remote_loader.download_profile("test", "model", str(storage_path), "test_download")
+
+    assert not (outside_path / "model.json").exists()
+
+
+async def test_download_does_not_follow_resource_redirects(
+    remote_loader: RemoteLoader,
+    mock_aioresponse: aioresponses,
+    tmp_path: Path,
+) -> None:
+    resource_url = LIBRARY_RESOURCE_URL
+    redirected_url = "http://192.168.1.1/model.json"
+    mock_aioresponse.get(
+        f"{ENDPOINT_DOWNLOAD}/test/model?hash=test_download",
+        status=200,
+        payload=[{"path": "model.json", "url": resource_url}],
+    )
+    mock_aioresponse.get(resource_url, status=302, headers={"Location": redirected_url})
+    mock_aioresponse.get(redirected_url, status=200, body=b"untrusted")
+    storage_path = tmp_path / "profiles"
+
+    with pytest.raises(ProfileDownloadError, match="Failed to download github URL"):
+        await remote_loader.download_profile("test", "model", str(storage_path), "test_download")
+
+    assert not (storage_path / "model.json").exists()
+
+
+async def test_download_rejects_oversized_resource(
+    remote_loader: RemoteLoader,
+    mock_aioresponse: aioresponses,
+    tmp_path: Path,
+) -> None:
+    """A resource larger than the cap must be refused instead of buffered and written."""
+    mock_aioresponse.get(
+        f"{ENDPOINT_DOWNLOAD}/test/model?hash=test_download",
+        status=200,
+        payload=[{"path": "model.json", "url": LIBRARY_RESOURCE_URL}],
+    )
+    mock_aioresponse.get(LIBRARY_RESOURCE_URL, status=200, body=b"x" * 64)
+    storage_path = tmp_path / "profiles"
+
+    with (
+        patch("custom_components.powercalc.power_profile.loader.remote.MAX_RESOURCE_SIZE", 16),
+        pytest.raises(ProfileDownloadError, match="larger than the maximum"),
+    ):
+        await remote_loader.download_profile("test", "model", str(storage_path), "test_download")
+
+    assert not (storage_path / "model.json").exists()
+
+
+async def test_download_rejects_too_many_resources(
+    remote_loader: RemoteLoader,
+    mock_aioresponse: aioresponses,
+    tmp_path: Path,
+) -> None:
+    resources = [
+        {"path": "model.json", "url": LIBRARY_RESOURCE_URL},
+        {"path": "data.csv.gz", "url": LIBRARY_CSV_RESOURCE_URL},
+    ]
+    mock_aioresponse.get(
+        f"{ENDPOINT_DOWNLOAD}/test/model?hash=test_download",
+        status=200,
+        payload=resources,
+    )
+
+    with (
+        patch("custom_components.powercalc.power_profile.loader.remote.MAX_PROFILE_RESOURCES", 1),
+        pytest.raises(ProfileDownloadError, match="maximum of 1 resources"),
+    ):
+        await remote_loader.download_profile("test", "model", str(tmp_path / "profiles"), "test_download")
+
+
+async def test_download_rejects_oversized_profile(
+    remote_loader: RemoteLoader,
+    mock_aioresponse: aioresponses,
+    tmp_path: Path,
+) -> None:
+    resources = [
+        {"path": "model.json", "url": LIBRARY_RESOURCE_URL},
+        {"path": "data.csv.gz", "url": LIBRARY_CSV_RESOURCE_URL},
+    ]
+    mock_aioresponse.get(
+        f"{ENDPOINT_DOWNLOAD}/test/model?hash=test_download",
+        status=200,
+        payload=resources,
+    )
+    mock_aioresponse.get(LIBRARY_RESOURCE_URL, status=200, body=b"x" * 8)
+    mock_aioresponse.get(LIBRARY_CSV_RESOURCE_URL, status=200, body=b"x" * 8)
+    storage_path = tmp_path / "profiles"
+
+    with (
+        patch("custom_components.powercalc.power_profile.loader.remote.MAX_PROFILE_DOWNLOAD_SIZE", 12),
+        patch("custom_components.powercalc.power_profile.loader.remote.MAX_RESOURCE_SIZE", 10),
+        pytest.raises(ProfileDownloadError, match="Remote profile is larger than the maximum"),
+    ):
+        await remote_loader.download_profile("test", "model", str(storage_path), "test_download")
+
+    assert not (storage_path / "model.json").exists()
+    assert not (storage_path / "data.csv.gz").exists()
+
+
+async def test_download_rejects_resources_after_profile_size_limit(
+    remote_loader: RemoteLoader,
+    mock_aioresponse: aioresponses,
+    tmp_path: Path,
+) -> None:
+    resources = [
+        {"path": "model.json", "url": LIBRARY_RESOURCE_URL},
+        {"path": "data.csv.gz", "url": LIBRARY_CSV_RESOURCE_URL},
+    ]
+    mock_aioresponse.get(
+        f"{ENDPOINT_DOWNLOAD}/test/model?hash=test_download",
+        status=200,
+        payload=resources,
+    )
+    mock_aioresponse.get(LIBRARY_RESOURCE_URL, status=200, body=b"x" * 12)
+    mock_aioresponse.get(LIBRARY_CSV_RESOURCE_URL, status=200, body=b"x")
+    storage_path = tmp_path / "profiles"
+
+    with (
+        patch("custom_components.powercalc.power_profile.loader.remote.MAX_PROFILE_DOWNLOAD_SIZE", 12),
+        patch("custom_components.powercalc.power_profile.loader.remote.MAX_RESOURCE_SIZE", 12),
+        pytest.raises(ProfileDownloadError, match="Remote profile is larger than the maximum"),
+    ):
+        await remote_loader.download_profile("test", "model", str(storage_path), "test_download")
+
+    assert not (storage_path / "model.json").exists()
+    assert not (storage_path / "data.csv.gz").exists()
+
+
+async def _async_chunks(chunks: list[bytes]) -> AsyncIterator[bytes]:
+    for chunk in chunks:
+        yield chunk
+
+
+def _streamed_response(chunks: list[bytes], content_length: int | None) -> ClientResponse:
+    """Build a minimal stand-in for a streamed aiohttp response."""
+    response = SimpleNamespace(
+        content_length=content_length,
+        content=SimpleNamespace(iter_chunked=lambda _size: _async_chunks(chunks)),
+    )
+    return cast(ClientResponse, response)
+
+
+async def test_read_capped_returns_a_body_within_the_limit() -> None:
+    assert await _read_capped(_streamed_response([b"abc", b"def"], 6), 16, "resource") == b"abcdef"
+
+
+@pytest.mark.parametrize(
+    "chunks, content_length",
+    [
+        ([b"x" * 32], 32),  # the server declares an oversized body up front
+        ([b"x" * 32], None),  # the server declares no length and streams an oversized body
+        ([b"x" * 8] * 4, 4),  # the server understates the body it then streams
+    ],
+)
+async def test_read_capped_rejects_an_oversized_body(chunks: list[bytes], content_length: int | None) -> None:
+    with pytest.raises(ProfileDownloadError, match="larger than the maximum"):
+        await _read_capped(_streamed_response(chunks, content_length), 16, "resource")
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        {},
+        {"manufacturers": ["invalid"]},
+        {"manufacturers": [{"dir_name": "test", "models": {}}]},
+        {"manufacturers": [{"dir_name": "test", "models": ["invalid"]}]},
+    ],
+)
+def test_validate_library_contents_rejects_invalid_structure(contents: object) -> None:
+    with pytest.raises(ProfileDownloadError, match="invalid"):
+        _validate_library_contents(contents)
 
 
 async def test_get_manufacturer_listing(remote_loader: RemoteLoader) -> None:
@@ -135,6 +607,12 @@ async def test_get_manufacturer_listing(remote_loader: RemoteLoader) -> None:
     assert ("signify", "Signify") in await remote_loader.get_manufacturer_listing(None, DiscoveryBy.DEVICE)
 
 
+async def test_get_discovery_low_priority_domains(remote_loader: RemoteLoader) -> None:
+    remote_loader.library_contents[LIBRARY_DISCOVERY_LOW_PRIORITY_DOMAINS] = ["low_priority", "other"]
+
+    assert remote_loader.get_discovery_low_priority_domains() == {"low_priority", "other"}
+
+
 async def test_get_model_listing(remote_loader: RemoteLoader) -> None:
     models = await remote_loader.get_model_listing("signify", {DeviceType.LIGHT})
     assert ("LCT010", "Hue White and Color Ambiance A19 E26 (Gen 3)") in models
@@ -142,6 +620,108 @@ async def test_get_model_listing(remote_loader: RemoteLoader) -> None:
     device_models = await remote_loader.get_model_listing("signify", None, DiscoveryBy.DEVICE)
     assert ("BSB002", "Hue Bridge V2") in device_models
     assert ("LCT010", "Hue White and Color Ambiance A19 E26 (Gen 3)") not in device_models
+
+
+async def test_get_model_listing_manual_profile(remote_loader: RemoteLoader) -> None:
+    """Manual profiles are listed only when explicitly requested."""
+    manual_models = await remote_loader.get_model_listing("netgear", None, DiscoveryBy.MANUAL)
+    entity_models = await remote_loader.get_model_listing("netgear", None, DiscoveryBy.ENTITY)
+
+    # Matched on the model id alone: the display name beside it is profile metadata, and gets
+    # rewritten whenever a manufacturer's profiles are normalized.
+    assert "GS110MX" in {model_id for model_id, _name in manual_models}
+    assert "GS110MX" not in {model_id for model_id, _name in entity_models}
+
+
+async def test_get_model_metadata_rejects_invalid_device_type(remote_loader: RemoteLoader) -> None:
+    remote_loader.model_infos["test/invalid"] = cast(
+        "LibraryModel",
+        {"id": "invalid", "hash": "hash", "device_type": "invalid"},
+    )
+
+    assert await remote_loader.get_model_metadata("test", "invalid") is None
+
+
+async def test_get_model_metadata_rejects_invalid_discovery_by(remote_loader: RemoteLoader) -> None:
+    remote_loader.model_infos["test/invalid"] = cast(
+        "LibraryModel",
+        {"id": "invalid", "hash": "hash", "device_type": "light", "discovery_by": "invalid"},
+    )
+
+    assert await remote_loader.get_model_metadata("test", "invalid") is None
+
+
+async def test_listings_skip_models_with_unknown_values(hass: HomeAssistant, mock_aioresponse: aioresponses) -> None:
+    """Models using a device type or discovery mode introduced in a newer Powercalc version must be ignored.
+
+    They may never break the listings for the installed version.
+    """
+    mock_aioresponse.get(
+        ENDPOINT_LIBRARY,
+        status=200,
+        payload={
+            "manufacturers": [
+                {
+                    "name": "future",
+                    "full_name": "Future",
+                    "dir_name": "future",
+                    "models": [
+                        {"id": "unknown_device_type", "device_type": "spaceship", "hash": "dummy"},
+                        {
+                            "id": "unknown_discovery_by",
+                            "device_type": "light",
+                            "discovery_by": "galaxy",
+                            "hash": "dummy",
+                        },
+                    ],
+                },
+                {
+                    "name": "known",
+                    "full_name": "Known",
+                    "dir_name": "known",
+                    "models": [{"id": "some_light", "device_type": "light", "hash": "dummy"}],
+                },
+            ],
+        },
+    )
+
+    loader = RemoteLoader(hass)
+    await loader.initialize()
+
+    for device_types in (None, {DeviceType.LIGHT}):
+        manufacturers = await loader.get_manufacturer_listing(device_types, DiscoveryBy.ENTITY)
+        assert ("known", "Known") in manufacturers
+        assert ("future", "Future") not in manufacturers
+
+    assert await loader.get_model_listing("future", None) == set()
+    assert await loader.get_model_metadata("future", "unknown_discovery_by") is None
+
+
+async def test_manufacturer_listing_skips_models_requiring_newer_version(
+    hass: HomeAssistant,
+    mock_aioresponse: aioresponses,
+) -> None:
+    mock_aioresponse.get(
+        ENDPOINT_LIBRARY,
+        status=200,
+        payload={
+            "manufacturers": [
+                {
+                    "name": "test_manu",
+                    "full_name": "Test manufacturer",
+                    "dir_name": "test_manu",
+                    "models": [
+                        {"id": "future_profile", "device_type": "light", "hash": "dummy", "min_version": "v99.0.0"},
+                    ],
+                },
+            ],
+        },
+    )
+
+    loader = RemoteLoader(hass)
+    await loader.initialize()
+
+    assert await loader.get_manufacturer_listing(None) == set()
 
 
 async def test_find_model_migration(hass: HomeAssistant, mock_aioresponse: aioresponses) -> None:
@@ -171,7 +751,11 @@ async def test_find_model_migration(hass: HomeAssistant, mock_aioresponse: aiore
     library = await ProfileLibrary.factory(hass)
 
     assert await library.find_model_migration(ModelInfo("eglo", "33955")) == ModelInfo("eglo", "900053", None)
-    assert await library.find_model_migration(ModelInfo("EGLO Leuchten".lower(), "33955")) == ModelInfo("eglo", "900053", None)
+    assert await library.find_model_migration(ModelInfo("EGLO Leuchten".lower(), "33955")) == ModelInfo(
+        "eglo",
+        "900053",
+        None,
+    )
 
 
 async def test_load_model_raises_library_exception_on_non_existing_model(remote_loader: RemoteLoader) -> None:
@@ -179,25 +763,38 @@ async def test_load_model_raises_library_exception_on_non_existing_model(remote_
         await remote_loader.load_model("signify", "NON_EXISTING_MODEL")
 
 
-async def test_download_profile_exception_unexpected_status_code(mock_aioresponse: aioresponses, remote_loader: RemoteLoader) -> None:
+async def test_download_profile_exception_unexpected_status_code(
+    mock_aioresponse: aioresponses,
+    remote_loader: RemoteLoader,
+    tmp_path: Path,
+) -> None:
     mock_aioresponse.get(
         f"{ENDPOINT_DOWNLOAD}/signify/LCA001?hash=test_download",
         status=500,
         repeat=True,
     )
 
+    profile_dir = str(tmp_path / "download")
     with pytest.raises(ProfileDownloadError):
-        await remote_loader.download_profile("signify", "LCA001", get_test_profile_dir("download"), "test_download")
+        await remote_loader.download_profile("signify", "LCA001", profile_dir, "test_download")
 
 
-async def test_exception_is_raised_on_connection_error(mock_aioresponse: aioresponses, remote_loader: RemoteLoader) -> None:
+async def test_exception_is_raised_on_connection_error(
+    mock_aioresponse: aioresponses,
+    remote_loader: RemoteLoader,
+    tmp_path: Path,
+) -> None:
     mock_aioresponse.get(f"{ENDPOINT_DOWNLOAD}/signify/LCA001?hash=test_download", exception=ClientError("test"))
 
+    profile_dir = str(tmp_path / "download")
     with pytest.raises(ProfileDownloadError):
-        await remote_loader.download_profile("signify", "LCA001", get_test_profile_dir("download"), "test_download")
+        await remote_loader.download_profile("signify", "LCA001", profile_dir, "test_download")
 
 
-async def test_exception_is_raised_on_github_resource_unavailable(mock_aioresponse: aioresponses, remote_loader: RemoteLoader) -> None:
+async def test_exception_is_raised_on_github_resource_unavailable(
+    mock_aioresponse: aioresponses,
+    remote_loader: RemoteLoader,
+) -> None:
     manufacturer = "signify"
     model = "LCA001"
     storage_path = remote_loader.get_storage_path(manufacturer, model)
@@ -226,7 +823,10 @@ async def test_exception_is_raised_on_github_resource_unavailable(mock_aiorespon
         await remote_loader.load_model(manufacturer, model)
 
 
-async def test_eventual_success_after_download_retry(mock_aioresponse: aioresponses, remote_loader: RemoteLoader) -> None:
+async def test_eventual_success_after_download_retry(
+    mock_aioresponse: aioresponses,
+    remote_loader: RemoteLoader,
+) -> None:
     manufacturer = "signify"
     model = "LCA001"
     storage_path = remote_loader.get_storage_path(manufacturer, model)
@@ -250,7 +850,7 @@ async def test_eventual_success_after_download_retry(mock_aioresponse: aiorespon
     callback = partial(remote_loader.download_profile, manufacturer, model, storage_path, "test_download")
     await remote_loader.download_with_retry(callback)
 
-    assert os.path.exists(storage_path)
+    assert await remote_loader.hass.async_add_executor_job(os.path.exists, storage_path)
 
 
 @pytest.mark.parametrize(
@@ -262,10 +862,10 @@ async def test_eventual_success_after_download_retry(mock_aioresponse: aiorespon
         ("018de85593a1b22b906f863677bb4891", "018de85593a1b22b906f863677bb4891", False, True),
     ],
 )
+@pytest.mark.usefixtures("mock_download_profile_endpoints")
 async def test_profile_redownloaded_when_newer_version_available(
     hass: HomeAssistant,
     mock_aioresponse: aioresponses,
-    mock_download_profile_endpoints: None,
     profile_hash: str | None,
     local_hash: str | None,
     exists_locally: bool,
@@ -308,8 +908,8 @@ async def test_profile_redownloaded_when_newer_version_available(
     local_storage_path = loader.get_storage_path("signify", "LCA001")
     clear_storage_dir(local_storage_path)
     hash_file = hass.config.path(STORAGE_DIR, "powercalc_profiles", ".profile_hashes")
-    if os.path.exists(hash_file):
-        os.remove(hash_file)
+    if await hass.async_add_executor_job(os.path.exists, hash_file):
+        await hass.async_add_executor_job(os.remove, hash_file)
 
     if local_hash:
         loader._write_profile_hashes({"signify/LCA001": local_hash})  # noqa: SLF001
@@ -329,20 +929,29 @@ async def test_profile_redownloaded_when_newer_version_available(
     assert actual_call_count == expected_call_count
 
 
-async def test_fallback_to_local_library(hass: HomeAssistant, mock_aioresponse: aioresponses, caplog: pytest.LogCaptureFixture) -> None:
+@pytest.mark.parametrize(
+    "response_kwargs",
+    [
+        pytest.param({"status": 404}, id="not found"),
+        # See: https://github.com/bramstroker/homeassistant-powercalc/issues/2277
+        pytest.param({"status": 200, "exception": ClientError("test")}, id="connection error"),
+        pytest.param({"status": 200, "exception": TimeoutError("test")}, id="timeout"),
+    ],
+)
+async def test_fallback_to_local_library(
+    hass: HomeAssistant,
+    mock_aioresponse: aioresponses,
+    caplog: pytest.LogCaptureFixture,
+    response_kwargs: dict,
+) -> None:
     """
     Test that the local library is used when the remote library is not available.
     When unavailable, it should retry 3 times before falling back to the local library.
     """
-
     shutil.copy(get_library_json_path(), hass.config.path(STORAGE_DIR, "powercalc_profiles", "library.json"))
 
     caplog.set_level(logging.WARNING)
-    mock_aioresponse.get(
-        ENDPOINT_LIBRARY,
-        status=404,
-        repeat=True,
-    )
+    mock_aioresponse.get(ENDPOINT_LIBRARY, repeat=True, **response_kwargs)
 
     loader = RemoteLoader(hass)
     loader.retry_timeout = 0
@@ -352,63 +961,12 @@ async def test_fallback_to_local_library(hass: HomeAssistant, mock_aioresponse: 
     assert len(caplog.records) >= 2
 
 
-async def test_fallback_to_local_library_on_client_connection_error(
+async def test_fallback_to_local_library_fails(
     hass: HomeAssistant,
     mock_aioresponse: aioresponses,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """
-    Test that the local library is used when api.powercalc.nl is not available.
-    See: https://github.com/bramstroker/homeassistant-powercalc/issues/2277
-    """
-    shutil.copy(get_library_json_path(), hass.config.path(STORAGE_DIR, "powercalc_profiles", "library.json"))
-
-    caplog.set_level(logging.WARNING)
-    mock_aioresponse.get(
-        ENDPOINT_LIBRARY,
-        status=200,
-        repeat=True,
-        exception=ClientError("test"),
-    )
-
-    loader = RemoteLoader(hass)
-    loader.retry_timeout = 0
-    await loader.initialize()
-
-    assert "signify" in loader.model_lookup
-    assert len(caplog.records) >= 2
-
-
-async def test_fallback_to_local_library_on_timeout(
-    hass: HomeAssistant,
-    mock_aioresponse: aioresponses,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """
-    Test that the local library is used when api.powercalc.nl times out.
-    """
-    shutil.copy(get_library_json_path(), hass.config.path(STORAGE_DIR, "powercalc_profiles", "library.json"))
-
-    caplog.set_level(logging.WARNING)
-    mock_aioresponse.get(
-        ENDPOINT_LIBRARY,
-        status=200,
-        repeat=True,
-        exception=TimeoutError("test"),
-    )
-
-    loader = RemoteLoader(hass)
-    loader.retry_timeout = 0
-    await loader.initialize()
-
-    assert "signify" in loader.model_lookup
-    assert len(caplog.records) >= 2
-
-
-async def test_fallback_to_local_library_fails(hass: HomeAssistant, mock_aioresponse: aioresponses, caplog: pytest.LogCaptureFixture) -> None:
-    """
-    After 3 retries, and the library.json is never downloaded before to .storage dir, it should raise a ProfileDownloadError.
-    """
+    """After 3 retries with no prior library.json in .storage, it should raise ProfileDownloadError."""
 
     with contextlib.suppress(FileNotFoundError):
         os.remove(hass.config.path(STORAGE_DIR, "powercalc_profiles", "library.json"))
@@ -426,9 +984,250 @@ async def test_fallback_to_local_library_fails(hass: HomeAssistant, mock_aioresp
         await loader.initialize()
 
 
+async def test_prefer_cached_skips_download(
+    hass: HomeAssistant,
+    mock_aioresponse: aioresponses,
+) -> None:
+    """With a library.json in local storage, initialize must not touch the download API."""
+    shutil.copy(get_library_json_path(), hass.config.path(STORAGE_DIR, "powercalc_profiles", "library.json"))
+
+    # Any request to the library endpoint fails the test, nothing may be downloaded.
+    mock_aioresponse.get(ENDPOINT_LIBRARY, repeat=True, exception=AssertionError("library.json was downloaded"))
+
+    loader = RemoteLoader(hass)
+    loader.retry_timeout = 0
+    await loader.initialize(prefer_cached=True)
+
+    assert "signify" in loader.model_lookup
+
+
+async def test_prefer_cached_downloads_when_no_local_copy(
+    hass: HomeAssistant,
+    mock_library_json_response: None,
+) -> None:
+    """On a fresh install there is nothing cached yet, so it must still download."""
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(hass.config.path(STORAGE_DIR, "powercalc_profiles", "library.json"))
+
+    loader = RemoteLoader(hass)
+    loader.retry_timeout = 0
+    await loader.initialize(prefer_cached=True)
+
+    assert "signify" in loader.model_lookup
+
+
+async def test_prefer_cached_redownloads_when_local_copy_is_corrupt(
+    hass: HomeAssistant,
+    mock_library_json_response: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A truncated library.json must not brick setup, it has to be discarded and downloaded again."""
+    local_path = hass.config.path(STORAGE_DIR, "powercalc_profiles", "library.json")
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    with open(local_path, "w") as f:
+        f.write('{"manufacturers": [')
+
+    loader = RemoteLoader(hass)
+    loader.retry_timeout = 0
+    await loader.initialize(prefer_cached=True)
+
+    assert "signify" in loader.model_lookup
+    assert "Local library.json is unusable" in caplog.text
+    with open(local_path) as f:
+        assert json.load(f)
+
+
+def test_oversized_local_library_is_discarded(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    local_path = Path(hass.config.path(STORAGE_DIR, "powercalc_profiles", "library.json"))
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    local_path.write_bytes(b"x" * 32)
+    loader = RemoteLoader(hass)
+
+    with patch("custom_components.powercalc.power_profile.loader.remote.MAX_LIBRARY_SIZE", 16):
+        assert loader._read_local_library_json() is None  # noqa: SLF001
+
+    assert "Local library is larger than the maximum" in caplog.text
+
+
+async def test_library_json_falls_back_when_download_fails_and_local_copy_is_corrupt(
+    hass: HomeAssistant,
+    mock_aioresponse: aioresponses,
+) -> None:
+    """With no usable local copy and no connection there is nothing to load, so setup must fail loudly."""
+    local_path = hass.config.path(STORAGE_DIR, "powercalc_profiles", "library.json")
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    with open(local_path, "w") as f:
+        f.write("not json at all")
+
+    mock_aioresponse.get(ENDPOINT_LIBRARY, repeat=True, exception=ClientError("no connection"))
+
+    loader = RemoteLoader(hass)
+    loader.retry_timeout = 0
+    with pytest.raises(ProfileDownloadError):
+        await loader.initialize()
+
+
+async def test_library_json_is_written_atomically(
+    hass: HomeAssistant,
+    mock_library_json_response: None,
+) -> None:
+    """The downloaded library.json must land via a rename, never by truncating the existing copy."""
+    local_path = hass.config.path(STORAGE_DIR, "powercalc_profiles", "library.json")
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    with open(local_path, "w") as f:
+        f.write('{"manufacturers": []}')
+
+    loader = RemoteLoader(hass)
+    loader.retry_timeout = 0
+
+    real_replace = os.replace
+    renamed: list[str] = []
+
+    def _record_replace(source: object, target: object) -> None:
+        renamed.append(str(target))
+        real_replace(cast(str, source), cast(str, target))
+
+    with patch(
+        "custom_components.powercalc.power_profile.loader.remote.os.replace",
+        side_effect=_record_replace,
+    ):
+        await loader.initialize()
+
+    assert local_path in renamed
+    assert "signify" in loader.model_lookup
+
+
+async def test_download_rejects_oversized_library(
+    hass: HomeAssistant,
+    mock_aioresponse: aioresponses,
+) -> None:
+    mock_aioresponse.get(ENDPOINT_LIBRARY, status=200, body=b"x" * 64)
+    loader = RemoteLoader(hass)
+
+    with (
+        patch("custom_components.powercalc.power_profile.loader.remote.MAX_LIBRARY_SIZE", 16),
+        pytest.raises(ProfileDownloadError, match="Remote library is larger than the maximum"),
+    ):
+        await loader._download_remote_library_json()  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    "manufacturer, model",
+    [
+        ("../outside", "model"),
+        ("test", "../outside"),
+    ],
+)
+async def test_download_rejects_unsafe_library_paths_before_caching(
+    hass: HomeAssistant,
+    mock_aioresponse: aioresponses,
+    manufacturer: str,
+    model: str,
+) -> None:
+    local_path = Path(hass.config.path(STORAGE_DIR, "powercalc_profiles", "library.json"))
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    original_contents = b'{"manufacturers": []}'
+    await hass.async_add_executor_job(local_path.write_bytes, original_contents)
+    mock_aioresponse.get(
+        ENDPOINT_LIBRARY,
+        status=200,
+        payload={
+            "manufacturers": [
+                {
+                    "name": "Test",
+                    "dir_name": manufacturer,
+                    "models": [{"id": model, "hash": "dummy"}],
+                },
+            ],
+        },
+    )
+    loader = RemoteLoader(hass)
+
+    with pytest.raises(ProfileDownloadError, match="invalid"):
+        await loader._download_remote_library_json()  # noqa: SLF001
+
+    assert await hass.async_add_executor_job(local_path.read_bytes) == original_contents
+
+
+async def test_corrupt_profile_hashes_are_discarded(
+    hass: HomeAssistant,
+    mock_library_json_response: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A truncated .profile_hashes must not fail setup, it only costs one extra download round."""
+    hash_file = hass.config.path(STORAGE_DIR, "powercalc_profiles", ".profile_hashes")
+    os.makedirs(os.path.dirname(hash_file), exist_ok=True)
+    with open(hash_file, "w") as f:
+        f.write('{"signify/LCA001": ')
+
+    loader = RemoteLoader(hass)
+    loader.retry_timeout = 0
+    await loader.initialize()
+
+    assert loader.profile_hashes == {}
+    assert "Profile hashes file is unusable" in caplog.text
+
+
+async def test_profile_hashes_are_written_atomically(hass: HomeAssistant) -> None:
+    """The hashes file must land via a rename, so a crash cannot leave it half written."""
+    hash_file = hass.config.path(STORAGE_DIR, "powercalc_profiles", ".profile_hashes")
+    os.makedirs(os.path.dirname(hash_file), exist_ok=True)
+    with open(hash_file, "w") as f:
+        f.write('{"signify/LCA001": "old"}')
+
+    loader = RemoteLoader(hass)
+    real_replace = os.replace
+    renamed: list[str] = []
+
+    def _record_replace(source: object, target: object) -> None:
+        renamed.append(str(target))
+        real_replace(cast(str, source), cast(str, target))
+
+    with patch(
+        "custom_components.powercalc.power_profile.loader.remote.os.replace",
+        side_effect=_record_replace,
+    ):
+        await hass.async_add_executor_job(loader._write_profile_hashes, {"signify/LCA001": "new"})  # noqa: SLF001
+
+    assert renamed == [hash_file]
+    with open(hash_file) as f:
+        assert json.load(f) == {"signify/LCA001": "new"}
+
+
+async def test_library_update_refreshes_from_remote(
+    hass: HomeAssistant,
+    mock_aioresponse: aioresponses,
+) -> None:
+    """The periodic update must re-download, even though a local copy exists."""
+    shutil.copy(get_library_json_path(), hass.config.path(STORAGE_DIR, "powercalc_profiles", "library.json"))
+
+    mock_aioresponse.get(
+        ENDPOINT_LIBRARY,
+        status=200,
+        payload={
+            "manufacturers": [
+                {
+                    "name": "acme",
+                    "dir_name": "acme",
+                    "models": [{"id": "widget", "device_type": "light", "hash": "dummy"}],
+                },
+            ],
+        },
+    )
+
+    loader = RemoteLoader(hass)
+    loader.retry_timeout = 0
+    await loader.initialize()
+
+    assert "acme" in loader.model_lookup
+    assert "signify" not in loader.model_lookup
+
+
 async def test_fallback_to_local_profile(
     mock_aioresponse: aioresponses,
-    mock_library_json_response: None,
     remote_loader: RemoteLoader,
 ) -> None:
     manufacturer = "signify"
@@ -443,13 +1242,12 @@ async def test_fallback_to_local_profile(
         repeat=True,
     )
 
-    await remote_loader.load_model(manufacturer, model, force_update=True)
+    assert await remote_loader.load_model(manufacturer, model, force_update=True)
 
 
 async def test_fallback_to_local_profile_on_timeout(
     hass: HomeAssistant,
     mock_aioresponse: aioresponses,
-    mock_library_json_response: None,
     remote_loader: RemoteLoader,
 ) -> None:
     manufacturer = "signify"
@@ -465,13 +1263,13 @@ async def test_fallback_to_local_profile_on_timeout(
         exception=TimeoutError("test"),
     )
 
-    await remote_loader.load_model(manufacturer, model, force_update=True)
+    assert await remote_loader.load_model(manufacturer, model, force_update=True)
 
 
+@pytest.mark.usefixtures("mock_download_profile_endpoints")
 async def test_profile_redownloaded_when_model_json_missing(
     hass: HomeAssistant,
     remote_loader: RemoteLoader,
-    mock_download_profile_endpoints: list[dict],
 ) -> None:
     """Test profile is redownloaded when model.json is missing."""
     local_storage_path = remote_loader.get_storage_path("signify", "LCA001")
@@ -482,25 +1280,64 @@ async def test_profile_redownloaded_when_model_json_missing(
     assert storage_path == local_storage_path
 
 
+async def test_concurrent_model_loads_only_download_profile_once(remote_loader: RemoteLoader) -> None:
+    """Concurrent entities using the same profile must not write the cached files concurrently."""
+    manufacturer = "signify"
+    model = "LCA001"
+    local_storage_path = remote_loader.get_storage_path(manufacturer, model)
+    clear_storage_dir(local_storage_path)
+    remote_loader.profile_hashes.pop(f"{manufacturer}/{model}", None)
+    download_started = asyncio.Event()
+    release_download = asyncio.Event()
+
+    async def _download_profile(
+        requested_manufacturer: str,
+        requested_model: str,
+        storage_path: str,
+        model_hash: str,
+    ) -> None:
+        download_started.set()
+        assert (requested_manufacturer, requested_model, model_hash) == (
+            manufacturer,
+            model,
+            remote_loader.model_infos[f"{manufacturer}/{model}"]["hash"],
+        )
+        await release_download.wait()
+        shutil.copytree(get_test_profile_dir("signify_LCA001"), storage_path, dirs_exist_ok=True)
+
+    with patch.object(remote_loader, "download_profile", side_effect=_download_profile) as mock_download:
+        first_load = asyncio.create_task(remote_loader.load_model(manufacturer, model))
+        await download_started.wait()
+        second_load = asyncio.create_task(remote_loader.load_model(manufacturer, model))
+        await asyncio.sleep(0)
+
+        assert mock_download.await_count == 1
+        release_download.set()
+        first_result, second_result = await asyncio.gather(first_load, second_load)
+
+    assert mock_download.await_count == 1
+    assert first_result == second_result
+
+
 async def test_profile_redownloaded_when_model_json_corrupt(
     remote_loader: RemoteLoader,
     mock_aioresponse: aioresponses,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Corrupt the model.json file and check if it is redownloaded."""
-    local_storage_path = remote_loader.get_storage_path("apple", "HomePod Mini")
+    local_storage_path = remote_loader.get_storage_path("apple", "A2374")
     shutil.rmtree(local_storage_path, ignore_errors=True)
     os.makedirs(local_storage_path)
 
     remote_files = [
         {
             "path": "model.json",
-            "url": "https://raw.githubusercontent.com/bramstroker/homeassistant-powercalc/master/profile_library/apple/HomePod Mini/model.json",
+            "url": "https://raw.githubusercontent.com/bramstroker/homeassistant-powercalc/master/profile_library/apple/A2374/model.json",
         },
     ]
 
     mock_aioresponse.get(
-        f"{ENDPOINT_DOWNLOAD}/apple/HomePod Mini?hash=b1107c61234f582a3c713b0891582e4e",
+        re.compile(rf"{ENDPOINT_DOWNLOAD}/apple/A2374.*"),
         status=200,
         payload=remote_files,
         repeat=True,
@@ -511,21 +1348,22 @@ async def test_profile_redownloaded_when_model_json_corrupt(
         status=200,
         body="invalid json",
     )
-    with open(get_library_path("apple/HomePod Mini/model.json"), "rb") as f:
+    with open(get_library_path("apple/A2374/model.json"), "rb") as f:
         mock_aioresponse.get(
             remote_files[0]["url"],
             status=200,
             body=f.read(),
         )
 
-    await remote_loader.load_model("apple", "HomePod Mini")
+    await remote_loader.load_model("apple", "A2374")
 
-    assert "model.json file is not valid JSON" in caplog.text
-    assert "Retrying to load model.json file" in caplog.text
+    recovery_records = [record for record in caplog.records if "model.json is not valid JSON" in record.message]
+    assert len(recovery_records) == 1
+    assert recovery_records[0].levelno == logging.WARNING
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
 
 
 async def test_profile_redownloaded_when_model_json_corrupt_retry_limit(
-    hass: HomeAssistant,
     remote_loader: RemoteLoader,
     mock_aioresponse: aioresponses,
     caplog: pytest.LogCaptureFixture,
@@ -534,19 +1372,19 @@ async def test_profile_redownloaded_when_model_json_corrupt_retry_limit(
     When model.json is corrupt, retry 3 times before giving up.
     After 3 times it should raise a LibraryLoadingError.
     """
-    local_storage_path = remote_loader.get_storage_path("apple", "HomePod Mini")
+    local_storage_path = remote_loader.get_storage_path("apple", "A2374")
     shutil.rmtree(local_storage_path, ignore_errors=True)
     os.makedirs(local_storage_path)
 
     remote_files = [
         {
             "path": "model.json",
-            "url": "https://raw.githubusercontent.com/bramstroker/homeassistant-powercalc/master/profile_library/apple/HomePod Mini/model.json",
+            "url": "https://raw.githubusercontent.com/bramstroker/homeassistant-powercalc/master/profile_library/apple/A2374/model.json",
         },
     ]
 
     mock_aioresponse.get(
-        f"{ENDPOINT_DOWNLOAD}/apple/HomePod Mini?hash=b1107c61234f582a3c713b0891582e4e",
+        re.compile(rf"{ENDPOINT_DOWNLOAD}/apple/A2374.*"),
         status=200,
         payload=remote_files,
         repeat=True,
@@ -560,19 +1398,45 @@ async def test_profile_redownloaded_when_model_json_corrupt_retry_limit(
     )
 
     with pytest.raises(LibraryLoadingError):
-        await remote_loader.load_model("apple", "HomePod Mini")
+        await remote_loader.load_model("apple", "A2374")
+
+    recovery_records = [record for record in caplog.records if "model.json is not valid JSON" in record.message]
+    assert len(recovery_records) == 2
+    assert all(record.levelno == logging.WARNING for record in recovery_records)
+    failure_records = [record for record in caplog.records if "model.json remains invalid" in record.message]
+    assert len(failure_records) == 1
+    assert failure_records[0].levelno == logging.ERROR
 
 
 @pytest.mark.parametrize(
     "manufacturer,phrases,expected_models,library_dir",
     [
-        ("apple", {"HomePod (gen 2)"}, ["MQJ83"], None),
+        ("apple", {"HomePod (gen 2)"}, ["A2825"], None),
+        ("athom", {"athom.rgbww-light"}, ["LB01-7W-E27"], None),
+        ("free", {"Freebox v8 (r1) (fbxgw8-r1)"}, ["Freebox v8 (r1)"], None),
+        ("google", {"Google Home Mini"}, ["H0A"], None),
+        ("google", {"Google Nest Mini"}, ["H2C"], None),
+        (
+            "ikea",
+            {"TRADFRI LED driver, 30 w (ICPSHC24-30EU-IL-1/ICPSHC24-10EU-IL-2"},
+            ["ICPSHC24-30EU-IL-1"],
+            None,
+        ),
+        ("lidl", {"TS0502A"}, ["HG06492A"], None),
+        ("lidl", {"TS0505B"}, ["HG08383A"], None),
+        ("mammotion", {"YUKA mini 600 (YUKA mini 600)"}, ["YUKA mini 600"], None),
+        ("mueller-licht", {"404094 (16W)"}, ["404094"], None),
+        ("signify", {"LST003"}, ["LST004"], None),
+        ("signify", {"9290018187B"}, ["LST004"], None),
+        ("signify", {"929003099201"}, ["LTC013"], None),
+        ("signify", {"929003099301"}, ["LTC016"], None),
+        ("signify", {"9290031346"}, ["LCD006"], None),
         ("apple", {"Non existing model"}, [], None),
         ("signify", {"LCA001", "LCT010"}, ["LCA001", "LCT010"], None),
         ("signify", {"lca001"}, ["LCA001"], None),
         ("test_manu", {"CCT Light"}, ["model1", "model2"], "multi_profile"),
         ("eq-3", {"HMIP-PSM"}, ["HmIP-PSM"], None),
-        ("shelly", {"Shelly 1PM mini gen3"}, ["Shelly 1PM Mini Gen3"], None),
+        ("shelly", {"Shelly 1PM mini gen3"}, ["S3SW-001P8EU"], None),
     ],
 )
 @pytest.mark.skip_remote_loader_mocking
@@ -583,10 +1447,16 @@ async def test_find_model(
     expected_models: list[str],
     library_dir: str,
 ) -> None:
-    with patch("custom_components.powercalc.power_profile.loader.remote.RemoteLoader.load_library_json") as mock_load_lib:
+    with patch(
+        "custom_components.powercalc.power_profile.loader.remote.RemoteLoader.load_library_json",
+    ) as mock_load_lib:
 
-        def load_library_json() -> dict:
-            library_path = get_test_config_dir(f"library_mock/{library_dir}/library.json") if library_dir else get_library_json_path()
+        def load_library_json(*_args: object) -> dict:
+            library_path = (
+                get_test_config_dir(f"library_mock/{library_dir}/library.json")
+                if library_dir
+                else get_library_json_path()
+            )
             with open(library_path) as f:
                 return json.load(f)
 
@@ -597,6 +1467,55 @@ async def test_find_model(
         await loader.initialize()
         actual_models = await loader.find_model(manufacturer, phrases)
         assert sorted(actual_models) == expected_models
+
+
+async def test_initialize_clears_cached_library_lookups(hass: HomeAssistant) -> None:
+    first_library = {
+        "manufacturers": [
+            {
+                "name": "Test",
+                "dir_name": "test",
+                "models": [
+                    {
+                        "id": "old_model",
+                        "name": "Old Model",
+                        "device_type": "light",
+                    },
+                ],
+            },
+        ],
+    }
+    second_library = {
+        "manufacturers": [
+            {
+                "name": "Test",
+                "dir_name": "test",
+                "models": [
+                    {
+                        "id": "new_model",
+                        "name": "New Model",
+                        "device_type": "light",
+                    },
+                ],
+            },
+        ],
+    }
+
+    with patch(
+        "custom_components.powercalc.power_profile.loader.remote.RemoteLoader.load_library_json",
+        new_callable=AsyncMock,
+        side_effect=[first_library, second_library],
+    ):
+        loader = RemoteLoader(hass)
+
+        await loader.initialize()
+        assert await loader.find_model("test", {"old_model"}) == ["old_model"]
+        assert await loader.get_model_listing("test", {DeviceType.LIGHT}) == {("old_model", "Old Model")}
+
+        await loader.initialize()
+        assert await loader.find_model("test", {"old_model"}) == []
+        assert await loader.find_model("test", {"new_model"}) == ["new_model"]
+        assert await loader.get_model_listing("test", {DeviceType.LIGHT}) == {("new_model", "New Model")}
 
 
 def clear_storage_dir(storage_path: str) -> None:
@@ -643,11 +1562,15 @@ async def test_multiple_manufacturer_aliases(hass: HomeAssistant, mock_aiorespon
 
     manufacturers = await library.find_manufacturers("my-alias")
     assert manufacturers == {"manufacturer1", "manufacturer2"}
+    manufacturers = await library.find_manufacturers("MY-ALIAS")
+    assert manufacturers == {"manufacturer1", "manufacturer2"}
 
     model_listing = await library.get_model_listing("my-alias", {DeviceType.LIGHT})
     assert len(model_listing) == 2
 
     models = await library.find_models(ModelInfo("my-alias", "model1"))
+    assert sorted(models) == [ModelInfo("manufacturer1", "model1"), ModelInfo("manufacturer2", "model1")]
+    models = await library.find_models(ModelInfo("MY-ALIAS", "model1"))
     assert sorted(models) == [ModelInfo("manufacturer1", "model1"), ModelInfo("manufacturer2", "model1")]
 
 
@@ -659,9 +1582,11 @@ async def test_multiple_manufacturer_aliases(hass: HomeAssistant, mock_aiorespon
     ],
 )
 async def test_min_version(hass: HomeAssistant, version: str, expect_model: bool) -> None:
-    with patch("custom_components.powercalc.power_profile.loader.remote.RemoteLoader.load_library_json") as mock_load_lib:
+    with patch(
+        "custom_components.powercalc.power_profile.loader.remote.RemoteLoader.load_library_json",
+    ) as mock_load_lib:
 
-        def load_library_json() -> dict:
+        def load_library_json(*_args: object) -> dict:
             with open(get_test_config_dir("library_mock/min_version/library.json")) as f:
                 return json.load(f)
 

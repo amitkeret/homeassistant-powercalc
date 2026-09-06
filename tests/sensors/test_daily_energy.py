@@ -1,7 +1,7 @@
 from datetime import timedelta
 from unittest.mock import patch
 
-from homeassistant.components.sensor import SensorDeviceClass, SensorStateClass
+from homeassistant.components.sensor import ATTR_STATE_CLASS, SensorDeviceClass, SensorStateClass
 from homeassistant.const import (
     ATTR_DEVICE_CLASS,
     ATTR_ENTITY_ID,
@@ -16,10 +16,8 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant, State
 from homeassistant.exceptions import TemplateError
 from homeassistant.helpers.typing import ConfigType
-from homeassistant.util import dt
 import pytest
 from pytest_homeassistant_custom_component.common import (
-    async_fire_time_changed,
     mock_restore_cache,
 )
 
@@ -47,21 +45,21 @@ from custom_components.powercalc.sensors.daily_energy import (
 )
 from tests.common import (
     assert_entity_state,
-    create_input_boolean,
+    async_advance_time,
+    create_mock_config_entry,
     run_powercalc_setup,
     set_states,
-    setup_config_entry,
 )
 from tests.config_flow.test_global_configuration import create_mock_global_config_entry
 
 
-async def test_create_daily_energy_sensor_default_options(hass: HomeAssistant) -> None:
+def test_create_daily_energy_sensor_default_options(hass: HomeAssistant) -> None:
     sensor_config = {
         CONF_ENERGY_SENSOR_NAMING: "{} Energy",
         CONF_NAME: "My sensor",
         CONF_DAILY_FIXED_ENERGY: {},
     }
-    sensor = await create_daily_fixed_energy_sensor(hass, sensor_config)
+    sensor = create_daily_fixed_energy_sensor(hass, sensor_config)
     assert sensor
     assert sensor.name == "My sensor Energy"
     assert sensor.entity_id == "sensor.my_sensor_energy"
@@ -78,7 +76,7 @@ async def test_create_daily_energy_sensor_default_options(hass: HomeAssistant) -
         (UnitPrefix.MEGA, UnitOfEnergy.MEGA_WATT_HOUR),
     ],
 )
-async def test_create_daily_energy_sensor_unit_prefix_watt(
+def test_create_daily_energy_sensor_unit_prefix_watt(
     hass: HomeAssistant,
     unit_prefix: str,
     unit_of_measurement: str,
@@ -90,7 +88,7 @@ async def test_create_daily_energy_sensor_unit_prefix_watt(
         CONF_ENERGY_SENSOR_UNIT_PREFIX: unit_prefix,
         CONF_DAILY_FIXED_ENERGY: {},
     }
-    sensor = await create_daily_fixed_energy_sensor(hass, sensor_config)
+    sensor = create_daily_fixed_energy_sensor(hass, sensor_config)
     assert sensor
     assert sensor.name == "My sensor Energy"
     assert sensor.native_unit_of_measurement == unit_of_measurement
@@ -108,11 +106,15 @@ async def test_daily_energy_sensor_from_kwh_value(hass: HomeAssistant) -> None:
     )
 
     sensor_entity_id = "sensor.ip_camera_upstairs_energy"
-    state = hass.states.get(sensor_entity_id)
-    assert state
-    assert state.attributes.get("state_class") == SensorStateClass.TOTAL
-    assert state.attributes.get(ATTR_DEVICE_CLASS) == SensorDeviceClass.ENERGY
-    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == UnitOfEnergy.KILO_WATT_HOUR
+    assert_entity_state(
+        hass,
+        sensor_entity_id,
+        attributes={
+            ATTR_STATE_CLASS: SensorStateClass.TOTAL,
+            ATTR_DEVICE_CLASS: SensorDeviceClass.ENERGY,
+            ATTR_UNIT_OF_MEASUREMENT: UnitOfEnergy.KILO_WATT_HOUR,
+        },
+    )
 
     await _trigger_periodic_update(hass)
     assert_entity_state(hass, sensor_entity_id, "0.2500")
@@ -163,10 +165,14 @@ async def test_daily_energy_sensor_also_creates_power_sensor(
         },
     )
 
-    state = hass.states.get("sensor.ip_camera_upstairs_energy")
-    assert state
-    assert state.attributes.get(ATTR_DEVICE_CLASS) == SensorDeviceClass.ENERGY
-    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == UnitOfEnergy.KILO_WATT_HOUR
+    assert_entity_state(
+        hass,
+        "sensor.ip_camera_upstairs_energy",
+        attributes={
+            ATTR_DEVICE_CLASS: SensorDeviceClass.ENERGY,
+            ATTR_UNIT_OF_MEASUREMENT: UnitOfEnergy.KILO_WATT_HOUR,
+        },
+    )
 
     power_state = hass.states.get("sensor.ip_camera_upstairs_power")
     assert power_state
@@ -250,7 +256,7 @@ async def test_power_sensor_not_created_when_not_on_whole_day(
         ),
     ],
 )
-async def test_calculate_delta(
+def test_calculate_delta(
     hass: HomeAssistant,
     daily_fixed_options: ConfigType,
     elapsed_seconds: int,
@@ -261,13 +267,13 @@ async def test_calculate_delta(
         CONF_NAME: "My sensor",
         CONF_DAILY_FIXED_ENERGY: daily_fixed_options,
     }
-    sensor = await create_daily_fixed_energy_sensor(hass, sensor_config)
+    sensor = create_daily_fixed_energy_sensor(hass, sensor_config)
 
     delta = sensor.calculate_delta(elapsed_seconds)
     assert expected_delta == pytest.approx(float(delta), 0.001)
 
 
-async def test_calculate_delta_mega_watt_hour(hass: HomeAssistant) -> None:
+def test_calculate_delta_mega_watt_hour(hass: HomeAssistant) -> None:
     sensor_config = {
         CONF_ENERGY_SENSOR_NAMING: "{} Energy",
         CONF_NAME: "My sensor",
@@ -278,7 +284,7 @@ async def test_calculate_delta_mega_watt_hour(hass: HomeAssistant) -> None:
             CONF_VALUE: 12,
         },
     }
-    sensor = await create_daily_fixed_energy_sensor(hass, sensor_config)
+    sensor = create_daily_fixed_energy_sensor(hass, sensor_config)
 
     # Calculate delta after 1 hour
     delta = sensor.calculate_delta(3600)
@@ -301,7 +307,7 @@ async def test_template_value(hass: HomeAssistant) -> None:
     )
 
     # Trigger calculation in the future
-    async_fire_time_changed(hass, dt.utcnow() + timedelta(seconds=43200))
+    await async_advance_time(hass, 43200, block=False)
 
     assert_entity_state(hass, "sensor.router_energy", "0.0250")
 
@@ -311,7 +317,7 @@ async def test_config_flow_template_value(hass: HomeAssistant) -> None:
     Test that power sensor is correctly created when a template is used as the value
     See https://github.com/bramstroker/homeassistant-powercalc/issues/980
     """
-    await setup_config_entry(
+    await create_mock_config_entry(
         hass,
         {
             CONF_NAME: "My daily",
@@ -327,7 +333,7 @@ async def test_config_flow_template_value(hass: HomeAssistant) -> None:
 
 
 async def test_config_flow_decimal_value(hass: HomeAssistant) -> None:
-    await setup_config_entry(
+    await create_mock_config_entry(
         hass,
         {
             CONF_NAME: "My daily",
@@ -439,16 +445,16 @@ async def test_calibrate_service(hass: HomeAssistant) -> None:
     assert_entity_state(hass, entity_id, "100.0000")
 
 
-async def test_restore_state(hass: HomeAssistant) -> None:
-    mock_restore_cache(
-        hass,
-        [
-            State(
-                "sensor.my_daily_energy",
-                "0.5",
-            ),
-        ],
-    )
+@pytest.mark.parametrize(
+    "restored_state, expected_state",
+    [
+        pytest.param("0.5", "0.5000", id="numeric"),
+        # A state that cannot be converted to a decimal must fall back to zero rather than raise.
+        pytest.param("unknown", "0.0000", id="not a number"),
+    ],
+)
+async def test_restore_state(hass: HomeAssistant, restored_state: str, expected_state: str) -> None:
+    mock_restore_cache(hass, [State("sensor.my_daily_energy", restored_state)])
 
     await run_powercalc_setup(
         hass,
@@ -460,33 +466,7 @@ async def test_restore_state(hass: HomeAssistant) -> None:
         },
     )
 
-    assert_entity_state(hass, "sensor.my_daily_energy", "0.5000")
-
-
-async def test_restore_state_catches_decimal_conversion_exception(
-    hass: HomeAssistant,
-) -> None:
-    mock_restore_cache(
-        hass,
-        [
-            State(
-                "sensor.my_daily_energy",
-                "unknown",
-            ),
-        ],
-    )
-
-    await run_powercalc_setup(
-        hass,
-        {
-            CONF_NAME: "My daily",
-            CONF_DAILY_FIXED_ENERGY: {
-                CONF_VALUE: 1.5,
-            },
-        },
-    )
-
-    assert_entity_state(hass, "sensor.my_daily_energy", "0.0000")
+    assert_entity_state(hass, "sensor.my_daily_energy", expected_state)
 
 
 async def test_small_update_frequency_updates_correctly(hass: HomeAssistant) -> None:
@@ -511,7 +491,6 @@ async def test_small_update_frequency_updates_correctly(hass: HomeAssistant) -> 
 async def test_name_and_entity_id_can_be_inherited_from_source_entity(
     hass: HomeAssistant,
 ) -> None:
-    await create_input_boolean(hass, "test")
     await run_powercalc_setup(
         hass,
         {
@@ -528,7 +507,7 @@ async def test_name_and_entity_id_can_be_inherited_from_source_entity(
 async def test_create_daily_energy_sensor_using_config_entry(
     hass: HomeAssistant,
 ) -> None:
-    await setup_config_entry(
+    await create_mock_config_entry(
         hass,
         {
             CONF_SENSOR_TYPE: SensorType.DAILY_ENERGY,
@@ -560,20 +539,18 @@ async def test_template_error_catched(hass: HomeAssistant, caplog: pytest.LogCap
             },
         )
         await _trigger_periodic_update(hass, 10)
-        assert "Could not render value template" in caplog.text
+        assert "Could not render template" in caplog.text
 
 
 async def test_entity_category(hass: HomeAssistant) -> None:
-    global_config_entry = create_mock_global_config_entry(
+    await create_mock_global_config_entry(
         hass,
         {
             CONF_ENERGY_SENSOR_CATEGORY: EntityCategory.DIAGNOSTIC,
         },
     )
-    global_config_entry.add_to_hass(hass)
-    assert await hass.config_entries.async_setup(global_config_entry.entry_id)
 
-    await setup_config_entry(
+    await create_mock_config_entry(
         hass,
         {
             CONF_SENSOR_TYPE: SensorType.DAILY_ENERGY,
@@ -593,8 +570,4 @@ async def _trigger_periodic_update(
     number_of_updates: int = 1,
 ) -> None:
     for _i in range(number_of_updates):
-        async_fire_time_changed(
-            hass,
-            dt.utcnow() + timedelta(seconds=DEFAULT_DAILY_UPDATE_FREQUENCY),
-        )
-        await hass.async_block_till_done()
+        await async_advance_time(hass, DEFAULT_DAILY_UPDATE_FREQUENCY)

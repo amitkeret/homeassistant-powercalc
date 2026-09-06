@@ -4,7 +4,6 @@ from unittest.mock import AsyncMock, patch
 
 from homeassistant.const import CONF_ENTITY_ID, STATE_ON
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.device_registry import DeviceEntry
 import pytest
 
 from custom_components.powercalc import CONF_DISABLE_LIBRARY_DOWNLOAD
@@ -14,8 +13,14 @@ from custom_components.powercalc.power_profile.library import ModelInfo, Profile
 from custom_components.powercalc.power_profile.loader.composite import CompositeLoader
 from custom_components.powercalc.power_profile.loader.local import LocalLoader
 from custom_components.powercalc.power_profile.loader.remote import RemoteLoader
-from tests.common import assert_entity_state, get_test_profile_dir, run_powercalc_setup, set_states
-from tests.conftest import MockEntityWithModel
+from tests.common import (
+    assert_entity_state,
+    build_device_entry,
+    get_test_profile_dir,
+    mock_device_with_entities,
+    run_powercalc_setup,
+    set_states,
+)
 
 
 async def test_manufacturer_listing(hass: HomeAssistant) -> None:
@@ -29,7 +34,13 @@ async def test_manufacturer_listing(hass: HomeAssistant) -> None:
 @pytest.mark.parametrize(
     "manufacturer,expected_models",
     [
-        ("signify", [("LCT010", "Hue White and Color Ambiance A19 E26 (Gen 3)"), ("LCA007", "Hue White and Color Ambiance A19 E26 1100lm")]),
+        (
+            "signify",
+            [
+                ("LCT010", "Hue White and Color Ambiance A19 E26 (Gen 3)"),
+                ("LCA007", "Hue White and Color Ambiance A19 E26 1100lm"),
+            ],
+        ),
         ("Signify Netherlands B.V.", [("LCT010", "Hue White and Color Ambiance A19 E26 (Gen 3)")]),
     ],
 )
@@ -46,7 +57,7 @@ async def test_model_listing_sorted(hass: HomeAssistant) -> None:
     models = await library.get_model_listing("signify")
 
     expected = [
-        "1740193P0",
+        "915005561201",
         "9290030514",
         "LCA007",
         "LCT010",
@@ -69,6 +80,16 @@ async def test_find_models(hass: HomeAssistant, model_info: ModelInfo, expected_
     library = await ProfileLibrary.factory(hass)
     models = sorted(await library.find_models(model_info))
     assert [model.model for model in models] == expected_models
+
+
+async def test_factory_prefers_cached_library(hass: HomeAssistant) -> None:
+    """Startup must load the library from local storage, never blocking on the download API."""
+    with patch(
+        "custom_components.powercalc.power_profile.library.ProfileLibrary.initialize",
+    ) as mock_initialize:
+        await ProfileLibrary.factory(hass)
+
+    mock_initialize.assert_called_once_with(prefer_cached=True)
 
 
 async def test_find_model_migration(hass: HomeAssistant) -> None:
@@ -116,7 +137,7 @@ async def test_non_existing_manufacturer_returns_empty_model_list(
         (ModelInfo("signify", "Hue go", "LLC020"), "signify", "LLC020"),
         (ModelInfo("ikea", "TRADFRI bulb E14 WS opal 400lm"), "ikea", "LED1536G5"),
         (ModelInfo("signify", "Hue Play", "440400982841"), "signify", "LCT024"),
-        (ModelInfo("wiz", "SHRGB"), "wiz", "SHRGB"),
+        (ModelInfo("wiz", "929003500001"), "wiz", "929003500001"),
         (ModelInfo("tuya", "TS011F"), "tuya", "TS011F"),
     ],
 )
@@ -136,8 +157,9 @@ async def test_get_profile(
 
 async def test_get_non_existing_profile_raises_exception(hass: HomeAssistant) -> None:
     library = await ProfileLibrary.factory(hass)
+    model_info = ModelInfo("foo", "bar")
     with pytest.raises(LibraryError):
-        await library.get_profile(ModelInfo("foo", "bar"))
+        await library.get_profile(model_info)
 
 
 async def test_hidden_directories_are_skipped_from_model_listing(
@@ -151,17 +173,13 @@ async def test_hidden_directories_are_skipped_from_model_listing(
     assert len(caplog.records) == 0
 
 
-async def test_exception_is_raised_when_no_model_json_present(
-    hass: HomeAssistant,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+async def test_exception_is_raised_when_no_model_json_present(hass: HomeAssistant) -> None:
     library = await ProfileLibrary.factory(hass)
+    model_info = ModelInfo("foo", "bar")
+    source_entity = create_source_entity("light.test", hass)
+    profile_dir = get_test_profile_dir("no_model_json")
     with pytest.raises(LibraryLoadingError):
-        await library.create_power_profile(
-            ModelInfo("foo", "bar"),
-            await create_source_entity("light.test", hass),
-            get_test_profile_dir("no_model_json"),
-        )
+        await library.create_power_profile(model_info, source_entity, profile_dir)
 
 
 async def test_create_power_profile_raises_library_error(hass: HomeAssistant) -> None:
@@ -172,8 +190,9 @@ async def test_create_power_profile_raises_library_error(hass: HomeAssistant) ->
     mock_loader.find_model = AsyncMock(return_value=ModelInfo("signify", "LCT010"))
     library = ProfileLibrary(hass, loader=mock_loader)
     await library.initialize()
+    model_info = ModelInfo("signify", "LCT010")
     with pytest.raises(LibraryError):
-        await library.create_power_profile(ModelInfo("signify", "LCT010"))
+        await library.create_power_profile(model_info)
 
 
 async def test_create_power_raise_library_error_when_model_not_found(hass: HomeAssistant) -> None:
@@ -184,11 +203,10 @@ async def test_create_power_raise_library_error_when_model_not_found(hass: HomeA
     mock_loader.find_model = AsyncMock(return_value=[])
     library = ProfileLibrary(hass, loader=mock_loader)
     await library.initialize()
+    model_info = ModelInfo("signify", "LCT010")
+    source_entity = create_source_entity("light.test", hass)
     with pytest.raises(LibraryError):
-        await library.create_power_profile(
-            ModelInfo("signify", "LCT010"),
-            await create_source_entity("light.test", hass),
-        )
+        await library.create_power_profile(model_info, source_entity)
 
 
 async def test_create_power_raise_library_error_when_manufacturer_not_found(hass: HomeAssistant) -> None:
@@ -198,11 +216,10 @@ async def test_create_power_raise_library_error_when_manufacturer_not_found(hass
     mock_loader.find_manufacturers = AsyncMock(return_value=None)
     library = ProfileLibrary(hass, loader=mock_loader)
     await library.initialize()
+    model_info = ModelInfo("signify", "LCT010")
+    source_entity = create_source_entity("light.test", hass)
     with pytest.raises(LibraryError):
-        await library.create_power_profile(
-            ModelInfo("signify", "LCT010"),
-            await create_source_entity("light.test", hass),
-        )
+        await library.create_power_profile(model_info, source_entity)
 
 
 @pytest.mark.parametrize(
@@ -224,7 +241,12 @@ def test_compute_replacement_variables_raises_clear_error_when_related_entity_mi
     expected_message: str,
 ) -> None:
     library = ProfileLibrary(hass, loader=LocalLoader(hass, ""))
-    source_entity = SourceEntity("test", "switch.test", "switch", device_entry=DeviceEntry(id="device_1"))
+    source_entity = SourceEntity(
+        "test",
+        "switch.test",
+        "switch",
+        device_entry=build_device_entry(config_entry_id="test", id="device_1"),
+    )
 
     with pytest.raises(LibraryError, match=expected_message):
         library.compute_replacement_variables({placeholder}, {}, source_entity)
@@ -252,7 +274,10 @@ async def test_linked_profile_loading(hass: HomeAssistant) -> None:
 
     assert profile.get_model_directory().endswith("signify/LCA006")
 
-    assert os.path.exists(os.path.join(profile.get_model_directory(), "color_temp.csv.gz"))
+    assert await hass.async_add_executor_job(
+        os.path.exists,
+        os.path.join(profile.get_model_directory(), "color_temp.csv.gz"),
+    )
 
 
 async def test_linked_profile_loading_failed(hass: HomeAssistant) -> None:
@@ -261,7 +286,7 @@ async def test_linked_profile_loading_failed(hass: HomeAssistant) -> None:
     remote_loader_class = "custom_components.powercalc.power_profile.loader.remote.RemoteLoader"
     with patch(f"{remote_loader_class}.load_model") as mock_load_model:
 
-        async def async_load_model_patch(manufacturer: str, __: str) -> tuple[dict, str] | None:
+        def async_load_model_patch(manufacturer: str, __: str) -> tuple[dict, str] | None:
             if manufacturer == "foo":
                 return None
 
@@ -273,16 +298,17 @@ async def test_linked_profile_loading_failed(hass: HomeAssistant) -> None:
 
         mock_load_model.side_effect = async_load_model_patch
 
+        model_info = ModelInfo("signify", "LCA001")
         with pytest.raises(LibraryError):
-            await library.get_profile(ModelInfo("signify", "LCA001"))
+            await library.get_profile(model_info)
 
 
 async def test_autodiscover_model_with_default_sub_profile(
     hass: HomeAssistant,
-    mock_entity_with_model_information: MockEntityWithModel,
 ) -> None:
     """Test autodiscover model with default sub profile."""
-    mock_entity_with_model_information(
+    mock_device_with_entities(
+        hass,
         "switch.test",
         "shelly",
         "Shelly Plus 1PM",
@@ -296,12 +322,12 @@ async def test_autodiscover_model_with_default_sub_profile(
 
 async def test_linked_profile_fixed(
     hass: HomeAssistant,
-    mock_entity_with_model_information: MockEntityWithModel,
 ) -> None:
     """
     See https://github.com/bramstroker/homeassistant-powercalc/pull/3406
     """
-    mock_entity_with_model_information(
+    mock_device_with_entities(
+        hass,
         "switch.test",
         "test",
         "linked_profile_fixed",

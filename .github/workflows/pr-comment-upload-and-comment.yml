@@ -1,75 +1,96 @@
-name: PR comment - Upload and comment
+name: Comment with PR plots
 
 on:
   workflow_run:
-    workflows: [PR comment - Generate plots]
+    workflows: [Generate PR plots]
     types:
       - completed
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Generate PR plots run ID to download artifacts from.
+        required: true
+      pr_number:
+        description: Pull request number to comment on.
+        required: true
 
 permissions:
-  pull-requests: write
-  contents: read
   actions: read
+  contents: read
+  issues: write
+  pull-requests: write
 
 jobs:
   upload:
     name: Upload plots to Imgur
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
+      - name: Checkout comment action
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Find plots artifact
+        id: artifact
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          RUN_ID: ${{ github.event.inputs.run_id || github.event.workflow_run.id }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const runId = Number(process.env.RUN_ID)
+            const { data } = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: runId,
+            })
+            core.setOutput('exists', data.artifacts.some((artifact) => artifact.name === 'plots') ? 'true' : 'false')
       - name: Download Artifact
-        uses: actions/download-artifact@v8
+        if: steps.artifact.outputs.exists == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: plots
           path: artifacts
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: ${{ github.event.workflow_run.id }}
+          run-id: ${{ github.event.inputs.run_id || github.event.workflow_run.id }}
+      - name: Read PR number
+        if: steps.artifact.outputs.exists == 'true'
+        id: pr
+        env:
+          PR_NUMBER: ${{ github.event.inputs.pr_number }}
+        run: |
+          if [ -n "${PR_NUMBER}" ]; then
+            pr_number="${PR_NUMBER}"
+          else
+            pr_number="$(tr -d '[:space:]' < artifacts/pr_number.txt)"
+          fi
+          echo "number=${pr_number}" >> "$GITHUB_OUTPUT"
       - name: Upload the plots to Imgur
-        uses: devicons/public-upload-to-imgur@v2
+        if: steps.artifact.outputs.exists == 'true'
+        uses: devicons/public-upload-to-imgur@b774d640a6703b5ce1deef66e7789409c217f3b2 # v2
         id: imgur_step
         with:
           path: ./artifacts/**/*.png
           client_id: ${{secrets.IMGUR_CLIENT_ID}}
       - name: Build PR message
+        if: steps.artifact.outputs.exists == 'true'
         id: build-pr-message
         run: |
-          echo 'PR_MESSAGE<<EOF' >> $GITHUB_OUTPUT
-          echo "Thank you for submitting light measurements!" >> $GITHUB_OUTPUT
-          echo -e "Here are some visualizations for the CSV files.\n" >> $GITHUB_OUTPUT
+          {
+            echo 'PR_MESSAGE<<EOF'
+            echo "Thank you for submitting Powercalc measurements!"
+            echo -e "Here are visualizations of the contributed profile data.\n"
+          } >> "$GITHUB_OUTPUT"
           for url in ${{ join(fromJSON(steps.imgur_step.outputs.imgur_urls), ' ') }}
           do
-            echo "![Image](${url})" >> $GITHUB_OUTPUT
+            echo "![Image](${url})" >> "$GITHUB_OUTPUT"
           done
-          echo 'EOF' >> $GITHUB_OUTPUT
+          echo 'EOF' >> "$GITHUB_OUTPUT"
       - name: Post Comment on PR
-        uses: actions/github-script@v9
+        if: steps.artifact.outputs.exists == 'true'
+        uses: ./.github/actions/upsert-pr-comment
         with:
-          script: |
-            const fs = require('fs');
-            const prNumber = Number(fs.readFileSync('artifacts/pr_number.txt'));
-            const repo = context.repo;
-            const prMessage = process.env.PR_MESSAGE;
-
-            const comments = await github.rest.issues.listComments({
-              owner: repo.owner,
-              repo: repo.repo,
-              issue_number: prNumber
-            });
-
-            const existingComment = comments.data.find(comment => comment.body.includes('Thank you for submitting'));
-            if (existingComment) {
-              await github.rest.issues.updateComment({
-                owner: repo.owner,
-                repo: repo.repo,
-                comment_id: existingComment.id,
-                body: prMessage
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: repo.owner,
-                repo: repo.repo,
-                issue_number: prNumber,
-                body: prMessage
-              });
-            }
-        env:
-          PR_MESSAGE: ${{ steps.build-pr-message.outputs.PR_MESSAGE }}
+          pr-number: ${{ steps.pr.outputs.number }}
+          body: ${{ steps.build-pr-message.outputs.PR_MESSAGE }}
+          match-text: Thank you for submitting

@@ -1,28 +1,29 @@
 import asyncio
 from collections.abc import Generator
+import contextlib
 from functools import lru_cache
+import inspect
 import json
 import logging
 import os
 import shutil
-from typing import Any, Protocol, cast
-from unittest.mock import AsyncMock, patch
-import uuid
+from typing import Any, cast
+from unittest.mock import AsyncMock, Mock, patch
 
 from _pytest.fixtures import SubRequest
+import aiohttp
+import aioresponses.core
 from homeassistant import loader
 from homeassistant.const import CONF_ENTITY_ID
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.device_registry import DeviceEntry
+from homeassistant.helpers.storage import STORAGE_DIR
 import pytest
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
-    RegistryEntryWithDefaults,
-    mock_device_registry,
-    mock_registry,
 )
 
 from custom_components.powercalc.const import (
+    BUILT_IN_LIBRARY_DIR,
     CONF_FIXED,
     CONF_POWER,
     CONF_SENSOR_TYPE,
@@ -31,6 +32,23 @@ from custom_components.powercalc.const import (
 )
 from custom_components.powercalc.helpers import get_library_json_path, get_library_path
 from tests.common import get_test_config_dir
+
+# Remove this once aioresponses supports aiohttp 3.14+.
+# See https://github.com/pnuckowski/aioresponses/issues/289.
+_client_response_init = aiohttp.ClientResponse.__init__
+if "stream_writer" in inspect.signature(_client_response_init).parameters:
+    _client_response_init_any = cast(Any, _client_response_init)
+
+    def _patched_client_response_init(self: aiohttp.ClientResponse, *args: object, **kwargs: object) -> None:
+        kwargs.setdefault("stream_writer", Mock(output_size=0))
+        _client_response_init_any(self, *args, **kwargs)
+
+    aiohttp.ClientResponse.__init__ = _patched_client_response_init  # type: ignore[method-assign]
+
+    def _patched_stream_reader_factory(loop: asyncio.AbstractEventLoop | None = None) -> aiohttp.StreamReader:
+        return aiohttp.StreamReader(Mock(), limit=2**16, loop=loop)
+
+    aioresponses.core.stream_reader_factory = _patched_stream_reader_factory
 
 
 @lru_cache(maxsize=1)
@@ -49,10 +67,9 @@ def set_logging_levels(request: SubRequest) -> None:
 
 
 @pytest.fixture(autouse=True)
-def auto_enable_custom_integrations(request: SubRequest) -> Generator:
+def auto_enable_custom_integrations(request: SubRequest) -> None:
     if "hass" in request.fixturenames:
         request.getfixturevalue("enable_custom_integrations")
-    yield
 
 
 @pytest.fixture(autouse=True)
@@ -61,6 +78,12 @@ def configure_hass_config_dir(request: SubRequest) -> None:
         return
     hass = request.getfixturevalue("hass")
     hass.config.config_dir = get_test_config_dir()
+
+    # The test .storage directory is scratch that survives between runs. The loader prefers a
+    # cached library.json when there is one, so drop it to keep every test starting from the
+    # same state a clean checkout has. Downloaded profiles are kept, they are only a cache.
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(hass.config.path(STORAGE_DIR, BUILT_IN_LIBRARY_DIR, "library.json"))
 
 
 @pytest.fixture(autouse=True)
@@ -108,68 +131,6 @@ def mock_flow_init(hass: HomeAssistant) -> Generator:
         yield mock_init
 
 
-class MockEntityWithModel(Protocol):
-    def __call__(
-        self,
-        entity_id: str | list[str],
-        manufacturer: str = "signify",
-        model: str = "LCT010",
-        model_id: str | None = None,
-        **entity_reg_kwargs: Any,  # noqa: ANN401
-    ) -> None: ...
-
-
-@pytest.fixture
-def mock_entity_with_model_information(hass: HomeAssistant) -> MockEntityWithModel:
-    def _mock_entity_with_model_information(
-        entity_id: str,
-        manufacturer: str = "signify",
-        model: str = "LCT010",
-        model_id: str | None = None,
-        **entity_reg_kwargs: Any,  # noqa: ANN401
-    ) -> None:
-        device_id = str(uuid.uuid4())
-        if "device_id" in entity_reg_kwargs:
-            device_id = entity_reg_kwargs["device_id"]
-            del entity_reg_kwargs["device_id"]
-
-        unique_id = str(uuid.uuid4())
-        if "unique_id" in entity_reg_kwargs:
-            unique_id = entity_reg_kwargs["unique_id"]
-            del entity_reg_kwargs["unique_id"]
-
-        platform = "foo"
-        if "platform" in entity_reg_kwargs:
-            platform = entity_reg_kwargs["platform"]
-            del entity_reg_kwargs["platform"]
-
-        mock_entries: dict[str, Any] = {}
-        entity_ids = entity_id if isinstance(entity_id, list) else [entity_id]
-        for entity_id in entity_ids:
-            mock_entries[entity_id] = RegistryEntryWithDefaults(
-                entity_id=entity_id,
-                unique_id=unique_id + "_" + entity_id,
-                platform=platform,
-                device_id=device_id,
-                **entity_reg_kwargs,
-            )
-
-        mock_registry(hass, mock_entries)
-        mock_device_registry(
-            hass,
-            {
-                device_id: DeviceEntry(
-                    id=device_id,
-                    manufacturer=manufacturer,
-                    model=model,
-                    model_id=model_id,
-                ),
-            },
-        )
-
-    return _mock_entity_with_model_information
-
-
 @pytest.fixture(autouse=True)
 def mock_remote_loader(request: SubRequest) -> Generator:
     if "skip_remote_loader_mocking" in request.keywords:
@@ -183,8 +144,12 @@ def mock_remote_loader(request: SubRequest) -> Generator:
         shutil.copytree(source_dir, storage_path)
 
     remote_loader_class = "custom_components.powercalc.power_profile.loader.remote.RemoteLoader"
-    with patch(f"{remote_loader_class}.download_profile") as mock_download, patch(f"{remote_loader_class}.load_library_json") as mock_load_lib:
+    with (
+        patch(f"{remote_loader_class}.download_profile") as mock_download,
+        patch(f"{remote_loader_class}.load_library_json") as mock_load_lib,
+    ):
         mock_download.side_effect = side_effect
 
-        mock_load_lib.side_effect = _load_test_library_json
+        # Swallow the prefer_cached argument, the test library is always served from disk.
+        mock_load_lib.side_effect = lambda *_args, **_kwargs: _load_test_library_json()
         yield

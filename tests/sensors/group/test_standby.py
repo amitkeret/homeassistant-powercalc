@@ -1,5 +1,8 @@
 from homeassistant.components.mqtt.const import CONF_STATE_CLOSING, CONF_STATE_OPENING
+from homeassistant.components.utility_meter.const import DAILY
 from homeassistant.const import (
+    ATTR_ENTITY_ID,
+    ATTR_UNIT_OF_MEASUREMENT,
     CONF_ENTITY_ID,
     STATE_OFF,
     STATE_ON,
@@ -7,11 +10,15 @@ from homeassistant.const import (
     STATE_PLAYING,
     STATE_STANDBY,
     STATE_UNKNOWN,
+    UnitOfPower,
 )
 from homeassistant.core import HomeAssistant
 
 from custom_components.powercalc import CONF_CREATE_STANDBY_GROUP
 from custom_components.powercalc.const import (
+    ATTR_MEMBERS,
+    ATTR_STATE,
+    CONF_CREATE_UTILITY_METERS,
     CONF_FIXED,
     CONF_MANUFACTURER,
     CONF_MODE,
@@ -19,6 +26,9 @@ from custom_components.powercalc.const import (
     CONF_POWER,
     CONF_STANDBY_POWER,
     CONF_STATES_POWER,
+    CONF_UTILITY_METER_TYPES,
+    DOMAIN,
+    SERVICE_DEBUG_GROUP,
     CalculationStrategy,
 )
 from tests.common import assert_entity_state, run_powercalc_setup, set_states
@@ -54,6 +64,86 @@ async def test_standby_group(hass: HomeAssistant) -> None:
 
     await set_states(hass, [("input_boolean.test2", STATE_ON)])
     assert_entity_state(hass, "sensor.all_standby_power", "0.20")
+
+
+async def test_debug_standby_group_action(hass: HomeAssistant) -> None:
+    await run_powercalc_setup(
+        hass,
+        [
+            {
+                CONF_ENTITY_ID: "input_boolean.test1",
+                CONF_STANDBY_POWER: 0.2,
+                CONF_MODE: CalculationStrategy.FIXED,
+                CONF_FIXED: {CONF_POWER: 20},
+            },
+            {
+                CONF_ENTITY_ID: "input_boolean.test2",
+                CONF_STANDBY_POWER: 0.3,
+                CONF_MODE: CalculationStrategy.FIXED,
+                CONF_FIXED: {CONF_POWER: 40},
+            },
+        ],
+    )
+
+    await set_states(hass, [("input_boolean.test1", STATE_OFF), ("input_boolean.test2", STATE_OFF)])
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_DEBUG_GROUP,
+        {ATTR_ENTITY_ID: "sensor.all_standby_power"},
+        blocking=True,
+        return_response=True,
+    )
+
+    assert response["sensor.all_standby_power"] == {
+        ATTR_STATE: "0.50",
+        ATTR_UNIT_OF_MEASUREMENT: UnitOfPower.WATT,
+        ATTR_MEMBERS: {
+            "sensor.test1_power": {
+                ATTR_STATE: "0.20",
+                ATTR_UNIT_OF_MEASUREMENT: UnitOfPower.WATT,
+            },
+            "sensor.test2_power": {
+                ATTR_STATE: "0.30",
+                ATTR_UNIT_OF_MEASUREMENT: UnitOfPower.WATT,
+            },
+        },
+    }
+
+
+async def test_standby_group_includes_devices_already_off_at_startup(hass: HomeAssistant) -> None:
+    await set_states(hass, [("input_boolean.test", STATE_OFF)])
+
+    await run_powercalc_setup(
+        hass,
+        {
+            CONF_ENTITY_ID: "input_boolean.test",
+            CONF_STANDBY_POWER: 0.2,
+            CONF_MODE: CalculationStrategy.FIXED,
+            CONF_FIXED: {CONF_POWER: 20},
+        },
+    )
+
+    assert_entity_state(hass, "sensor.test_power", "0.20")
+    assert_entity_state(hass, "sensor.all_standby_power", "0.20")
+
+
+async def test_standby_group_utility_meter(hass: HomeAssistant) -> None:
+    await run_powercalc_setup(
+        hass,
+        {
+            CONF_ENTITY_ID: "input_boolean.test1",
+            CONF_STANDBY_POWER: 0.2,
+            CONF_MODE: CalculationStrategy.FIXED,
+            CONF_FIXED: {CONF_POWER: 20},
+        },
+        {
+            CONF_CREATE_UTILITY_METERS: True,
+            CONF_UTILITY_METER_TYPES: [DAILY],
+        },
+    )
+
+    assert hass.states.get("sensor.all_standby_energy_daily")
 
 
 async def test_self_usage_sensors_included(hass: HomeAssistant) -> None:

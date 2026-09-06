@@ -10,11 +10,9 @@ from homeassistant.components.light import (
     ColorMode,
 )
 from homeassistant.components.utility_meter.sensor import SensorDeviceClass
-from homeassistant.components.vacuum import (
-    ATTR_BATTERY_LEVEL,
-    VacuumActivity,
-)
+from homeassistant.components.vacuum import VacuumActivity
 from homeassistant.const import (
+    ATTR_BATTERY_LEVEL,
     ATTR_ENTITY_ID,
     CONF_ATTRIBUTE,
     CONF_ENTITIES,
@@ -32,15 +30,13 @@ from homeassistant.const import (
     EntityCategory,
 )
 from homeassistant.core import EVENT_HOMEASSISTANT_START, CoreState, HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.entity_registry import EntityRegistry
 from homeassistant.helpers.template import Template
 from homeassistant.util import dt
 import pytest
 from pytest_homeassistant_custom_component.common import (
-    RegistryEntryWithDefaults,
     async_fire_time_changed,
-    mock_registry,
 )
 
 from custom_components.powercalc import CONF_IGNORE_UNAVAILABLE_STATE, CONF_POWER_UPDATE_INTERVAL
@@ -78,18 +74,19 @@ from custom_components.powercalc.const import (
 )
 from tests.common import (
     assert_entity_state,
-    create_input_boolean,
+    async_advance_time,
+    create_mock_config_entry,
     get_simple_fixed_config,
     get_test_profile_dir,
+    mock_device_with_entities,
+    mock_entities_in_registry,
     run_powercalc_setup,
     set_states,
-    setup_config_entry,
 )
-from tests.conftest import MockEntityWithModel
 
 
 @pytest.mark.parametrize(
-    ("case", "expected_type", "expected_value"),
+    "case, expected_type, expected_value",
     [
         ("template", Template, None),
         ("template_string", Template, None),
@@ -99,10 +96,10 @@ from tests.conftest import MockEntityWithModel
         (3, Decimal, Decimal(3)),
     ],
 )
-async def test_resolve_standby_power_value(
+def test_resolve_standby_power_value(
     hass: HomeAssistant,
     case: Template | Decimal | str | float | None,
-    expected_type: type[Template] | type[Decimal],
+    expected_type: type[Template | Decimal],
     expected_value: Decimal | None,
 ) -> None:
     from custom_components.powercalc.sensors.power import _resolve_standby_power_value
@@ -128,17 +125,12 @@ async def test_resolve_standby_power_value(
 
 
 async def test_use_real_power_sensor_in_group(hass: HomeAssistant) -> None:
-    await create_input_boolean(hass)
+    await set_states(hass, [("input_boolean.test", STATE_OFF)])
 
-    mock_registry(
+    mock_entities_in_registry(
         hass,
         {
-            "sensor.existing_power": RegistryEntryWithDefaults(
-                entity_id="sensor.existing_power",
-                unique_id="1234",
-                platform="sensor",
-                device_class=SensorDeviceClass.POWER,
-            )
+            "sensor.existing_power": {"device_class": SensorDeviceClass.POWER},
         },
     )
 
@@ -160,16 +152,22 @@ async def test_use_real_power_sensor_in_group(hass: HomeAssistant) -> None:
         },
     )
 
-    group_state = hass.states.get("sensor.testgroup_power")
-    assert group_state
-    assert group_state.attributes.get(ATTR_ENTITIES) == {
-        "sensor.existing_power",
-        "sensor.test_power",
-    }
+    assert_entity_state(
+        hass,
+        "sensor.testgroup_power",
+        attributes={
+            ATTR_ENTITIES: {
+                "sensor.existing_power",
+                "sensor.test_power",
+            },
+        },
+    )
 
 
-async def test_rounding_precision(hass: HomeAssistant, entity_registry: EntityRegistry) -> None:
-    await create_input_boolean(hass)
+async def test_rounding_precision(hass: HomeAssistant) -> None:
+    # The source entity needs a unique id, otherwise the power sensor is not registered.
+    entity_registry = mock_entities_in_registry(hass, {"input_boolean.test": {}})
+    await set_states(hass, [("input_boolean.test", STATE_OFF)])
 
     await run_powercalc_setup(
         hass,
@@ -227,7 +225,7 @@ async def test_standby_power(hass: HomeAssistant) -> None:
 
 
 async def test_multiply_factor(hass: HomeAssistant) -> None:
-    await create_input_boolean(hass)
+    await set_states(hass, [("input_boolean.test", STATE_OFF)])
 
     await run_powercalc_setup(
         hass,
@@ -251,7 +249,6 @@ async def test_error_when_no_strategy_has_been_configured(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.ERROR)
-    await create_input_boolean(hass)
 
     await run_powercalc_setup(
         hass,
@@ -375,7 +372,6 @@ async def test_template_entity_not_double_tracked(hass: HomeAssistant, caplog: p
 
 async def test_unknown_source_entity_state(hass: HomeAssistant) -> None:
     """Power sensor should be unavailable when source entity state is unknown"""
-    await create_input_boolean(hass)
     await run_powercalc_setup(
         hass,
         {
@@ -426,7 +422,7 @@ async def test_sleep_power(hass: HomeAssistant) -> None:
     assert_entity_state(hass, power_entity_id, "20.00")
 
     # After 10 seconds the device goes into sleep mode, check the sleep power is set on the power sensor
-    async_fire_time_changed(hass, dt.utcnow() + timedelta(seconds=10))
+    await async_advance_time(hass, 10, block=False)
 
     assert_entity_state(hass, power_entity_id, "5.00")
 
@@ -438,14 +434,13 @@ async def test_sleep_power(hass: HomeAssistant) -> None:
 
     # Check that the sleepmode timer is reset correctly when the device goes to a non OFF state again
     await set_states(hass, [(entity_id, STATE_ON)])
-    async_fire_time_changed(hass, dt.utcnow() + timedelta(seconds=20))
+    await async_advance_time(hass, 20, block=False)
 
     assert_entity_state(hass, power_entity_id, "100.00")
 
 
 async def test_unavailable_power(hass: HomeAssistant) -> None:
     """Test specifying an alternative power value if the source entity is unavailable"""
-    await create_input_boolean(hass)
 
     await run_powercalc_setup(
         hass,
@@ -475,14 +470,13 @@ async def test_disable_extended_attributes(hass: HomeAssistant) -> None:
 
 async def test_manually_configured_sensor_overrides_profile(
     hass: HomeAssistant,
-    mock_entity_with_model_information: MockEntityWithModel,
 ) -> None:
     """
     Make sure that config settings done by user are not overridden by power profile
     """
     entity_id = "light.test"
 
-    mock_entity_with_model_information(entity_id, "sonoff", "ZBMINI")
+    mock_device_with_entities(hass, entity_id, "sonoff", "ZBMINI")
 
     await run_powercalc_setup(
         hass,
@@ -503,7 +497,7 @@ async def test_manually_configured_sensor_overrides_profile(
 
 
 async def test_standby_power_template(hass: HomeAssistant) -> None:
-    await create_input_boolean(hass)
+    await set_states(hass, [("input_boolean.test", STATE_OFF)])
 
     await run_powercalc_setup(
         hass,
@@ -589,13 +583,13 @@ async def test_multiply_factor_sleep_power(hass: HomeAssistant) -> None:
     )
 
     await set_states(hass, [("switch.test", STATE_OFF)])
-    async_fire_time_changed(hass, dt.utcnow() + timedelta(seconds=25))
+    await async_advance_time(hass, 25, block=False)
 
     assert_entity_state(hass, "sensor.test_power", "4.00")
 
 
 async def test_unload_entry_cancels_pending_sleep_power_timer(hass: HomeAssistant) -> None:
-    entry = await setup_config_entry(
+    entry = await create_mock_config_entry(
         hass,
         {
             CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
@@ -615,7 +609,7 @@ async def test_unload_entry_cancels_pending_sleep_power_timer(hass: HomeAssistan
 
     await hass.config_entries.async_unload(entry.entry_id)
 
-    async_fire_time_changed(hass, dt.utcnow() + timedelta(seconds=25))
+    await async_advance_time(hass, 25, block=False)
 
     assert_entity_state(hass, "sensor.test_power", STATE_UNAVAILABLE)
 
@@ -670,12 +664,12 @@ async def test_sub_profile_default_select(hass: HomeAssistant) -> None:
     )
 
     await set_states(hass, [("switch.test", STATE_ON)])
-    assert_entity_state(hass, "sensor.test_device_power", "0.80")
+    assert_entity_state(hass, "sensor.test_power", "0.80")
 
 
 async def test_switch_sub_profile_service(hass: HomeAssistant) -> None:
     unique_id = str(uuid.uuid4())
-    entry = await setup_config_entry(
+    entry = await create_mock_config_entry(
         hass,
         {
             CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
@@ -725,7 +719,7 @@ async def test_switch_sub_profile_raises_exception_when_profile_has_no_sub_profi
     hass: HomeAssistant,
 ) -> None:
     unique_id = str(uuid.uuid4())
-    await setup_config_entry(
+    await create_mock_config_entry(
         hass,
         {
             CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
@@ -741,7 +735,7 @@ async def test_switch_sub_profile_raises_exception_when_profile_has_no_sub_profi
     await set_states(hass, [("light.test", STATE_ON)])
     await run_powercalc_setup(hass)
 
-    with pytest.raises(HomeAssistantError):
+    with pytest.raises(ServiceValidationError) as exc_info:
         await hass.services.async_call(
             DOMAIN,
             SERVICE_SWITCH_SUB_PROFILE,
@@ -751,13 +745,14 @@ async def test_switch_sub_profile_raises_exception_when_profile_has_no_sub_profi
             },
             blocking=True,
         )
+    assert exc_info.value.translation_key == "no_sub_profile_support"
 
 
 async def test_switch_sub_profile_raises_exception_on_invalid_sub_profile(
     hass: HomeAssistant,
 ) -> None:
     unique_id = str(uuid.uuid4())
-    await setup_config_entry(
+    await create_mock_config_entry(
         hass,
         {
             CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
@@ -786,7 +781,7 @@ async def test_switch_sub_profile_raises_exception_on_invalid_sub_profile(
     )
     await run_powercalc_setup(hass)
 
-    with pytest.raises(HomeAssistantError):
+    with pytest.raises(ServiceValidationError) as exc_info:
         await hass.services.async_call(
             DOMAIN,
             SERVICE_SWITCH_SUB_PROFILE,
@@ -796,6 +791,7 @@ async def test_switch_sub_profile_raises_exception_on_invalid_sub_profile(
             },
             blocking=True,
         )
+    assert exc_info.value.translation_key == "unknown_sub_profile"
 
 
 async def test_availability_entity(hass: HomeAssistant) -> None:

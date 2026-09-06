@@ -1,11 +1,12 @@
+import argparse
 from collections import Counter
 
 from utils.library.common import find_model_json_files
 
 
-def count_field(field_name: str) -> Counter:
-    """Count occurrences of each measure_device in all model.json files."""
-    counter = Counter()
+def count_field(field_name: str) -> Counter[str]:
+    """Count occurrences of each value for the given field in all model.json files."""
+    counter: Counter[str] = Counter()
 
     for model_data in find_model_json_files():
         value = model_data["data"].get(field_name)
@@ -16,7 +17,16 @@ def count_field(field_name: str) -> Counter:
 
 
 def main() -> None:
-    counts = count_field("measure_device")
+    parser = argparse.ArgumentParser(description="Count value occurrences for a profile field in all model.json files.")
+    parser.add_argument(
+        "field",
+        nargs="?",
+        default="measure_device",
+        help="The profile field to count (default: measure_device)",
+    )
+    args = parser.parse_args()
+
+    counts = count_field(args.field)
 
     # Display sorted results
     print("\nCounts:")  # noqa: T201

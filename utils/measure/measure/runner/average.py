@@ -1,11 +1,10 @@
 import logging
-from typing import Any
+from statistics import mean
 
-import inquirer
+from measure.execution import ImmediateInteraction, RunInteraction
+from measure.request import AverageMeasurementRequest
+from measure.util.measure_util import MeasurementResult, MeasureUtil
 
-from measure.util.measure_util import MeasureUtil
-
-from .const import QUESTION_DURATION
 from .runner import MeasurementRunner, RunnerResult
 
 INTERVAL = 2
@@ -13,32 +12,50 @@ INTERVAL = 2
 _LOGGER = logging.getLogger("measure")
 
 
-class AverageRunner(MeasurementRunner):
-    def __init__(self, measure_util: MeasureUtil, duration: int = 60) -> None:
+class AverageRunner(MeasurementRunner[AverageMeasurementRequest]):
+    def __init__(
+        self,
+        measure_util: MeasureUtil,
+        interaction: RunInteraction | None = None,
+    ) -> None:
         self.measure_util = measure_util
-        self.duration = duration
-
-    def prepare(self, answers: dict[str, Any]) -> None:
-        self.duration = int(answers[QUESTION_DURATION])
+        self.duration = 60
+        self.elapsed = 0.0
+        self.interaction = interaction or ImmediateInteraction()
 
     def run(
         self,
-        answers: dict[str, Any],
+        request: AverageMeasurementRequest,
         export_directory: str,
-    ) -> RunnerResult | None:
-        input("Press enter to start")
+    ) -> RunnerResult:
+        self.duration = request.duration
+        self.elapsed = float(self.duration)
+        self.interaction.confirm("Ready to start the average measurement.")
+        self.interaction.phase("Starting averaging")
 
-        self.measure_util.take_average_measurement(self.duration)
+        result = self.measure_util.take_average_measurement(
+            self.duration,
+            on_progress=self._report_progress,
+            finish_on_interrupt=True,
+        )
 
-        return RunnerResult(model_json_data={})
+        summary = {
+            "Average power": f"{round(result.power, 2)} W",
+            "Duration": f"{round(self.elapsed, 1):g} s",
+        }
+        if result.voltages:
+            summary["Average voltage"] = f"{round(mean(result.voltages), 1)} V"
 
-    def get_questions(self) -> list[inquirer.questions.Question]:
-        return [
-            inquirer.Text(
-                name=QUESTION_DURATION,
-                message="For how long do you want to measure? In seconds",
-            ),
-        ]
+        return RunnerResult(model_json_data={}, voltages=result.voltages, summary=summary)
 
-    def measure_standby_power(self) -> float:
-        return 0
+    def _report_progress(self, elapsed: float, duration: float) -> None:
+        self.elapsed = elapsed
+        self.interaction.progress(
+            int(min(elapsed, duration)),
+            int(duration),
+            phase="Averaging",
+            remaining_seconds=max(0.0, duration - elapsed),
+        )
+
+    def measure_standby_power(self) -> MeasurementResult:
+        return MeasurementResult(power=0, voltages=[])

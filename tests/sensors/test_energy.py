@@ -2,6 +2,7 @@ from datetime import timedelta
 import logging
 from unittest.mock import patch
 
+from freezegun.api import FrozenDateTimeFactory
 from homeassistant.components.sensor import ATTR_STATE_CLASS, SensorStateClass
 from homeassistant.components.utility_meter.sensor import SensorDeviceClass
 from homeassistant.const import (
@@ -12,21 +13,17 @@ from homeassistant.const import (
     CONF_ENTITY_ID,
     CONF_NAME,
     CONF_UNIQUE_ID,
+    STATE_OFF,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
     EntityCategory,
     UnitOfEnergy,
     UnitOfPower,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.device_registry import DeviceEntry
-from homeassistant.helpers.entity_registry import EntityRegistry
+from homeassistant.helpers.typing import ConfigType
 from homeassistant.util import dt
 import pytest
-from pytest_homeassistant_custom_component.common import (
-    RegistryEntryWithDefaults,
-    async_fire_time_changed,
-    mock_device_registry,
-    mock_registry,
-)
 
 from custom_components.powercalc import CONF_ENERGY_UPDATE_INTERVAL
 from custom_components.powercalc.const import (
@@ -52,45 +49,24 @@ from custom_components.powercalc.const import (
 from custom_components.powercalc.sensors.energy import VirtualEnergySensor
 from tests.common import (
     assert_entity_state,
-    create_input_boolean,
+    async_advance_time,
     get_simple_fixed_config,
+    mock_device,
+    mock_entities_in_registry,
     mock_sensors_in_registry,
     run_powercalc_setup,
     set_states,
 )
 
 
-async def test_related_energy_sensor_is_used_for_existing_power_sensor(
-    hass: HomeAssistant,
-) -> None:
-    mock_device_registry(
-        hass,
-        {
-            "shelly-device": DeviceEntry(
-                id="shelly-device-id",
-                manufacturer="Shelly",
-                model="Plug S",
-            ),
-        },
-    )
+async def test_related_energy_sensor_is_used_for_existing_power_sensor(hass: HomeAssistant) -> None:
+    mock_device(hass, "shelly-device-id", "Shelly", "Plug S")
 
-    mock_registry(
+    mock_entities_in_registry(
         hass,
         {
-            "sensor.existing_power": RegistryEntryWithDefaults(
-                entity_id="sensor.existing_power",
-                unique_id="1234",
-                platform="sensor",
-                device_id="shelly-device-id",
-                device_class=SensorDeviceClass.POWER,
-            ),
-            "sensor.existing_energy": RegistryEntryWithDefaults(
-                entity_id="sensor.existing_energy",
-                unique_id="12345",
-                platform="sensor",
-                device_id="shelly-device-id",
-                device_class=SensorDeviceClass.ENERGY,
-            ),
+            "sensor.existing_power": {"device_id": "shelly-device-id", "device_class": SensorDeviceClass.POWER},
+            "sensor.existing_energy": {"device_id": "shelly-device-id", "device_class": SensorDeviceClass.ENERGY},
         },
     )
 
@@ -108,17 +84,25 @@ async def test_related_energy_sensor_is_used_for_existing_power_sensor(
         },
     )
 
-    power_state = hass.states.get("sensor.testgroup_power")
-    assert power_state
-    assert power_state.attributes.get(ATTR_ENTITIES) == {
-        "sensor.existing_power",
-    }
+    assert_entity_state(
+        hass,
+        "sensor.testgroup_power",
+        attributes={
+            ATTR_ENTITIES: {
+                "sensor.existing_power",
+            },
+        },
+    )
 
-    energy_state = hass.states.get("sensor.testgroup_energy")
-    assert energy_state
-    assert energy_state.attributes.get(ATTR_ENTITIES) == {
-        "sensor.existing_energy",
-    }
+    assert_entity_state(
+        hass,
+        "sensor.testgroup_energy",
+        attributes={
+            ATTR_ENTITIES: {
+                "sensor.existing_energy",
+            },
+        },
+    )
 
 
 async def test_force_create_energy_sensor_for_existing_power_sensor(
@@ -128,36 +112,14 @@ async def test_force_create_energy_sensor_for_existing_power_sensor(
     When the user uses `power_sensor_id` option and a related energy sensor already exists in the system,
     creation can be forced with `force_energy_sensor_creation`
     """
-    await create_input_boolean(hass)
 
-    mock_device_registry(
+    mock_device(hass, "shelly-device-id", "Shelly", "Plug S")
+
+    mock_entities_in_registry(
         hass,
         {
-            "shelly-device": DeviceEntry(
-                id="shelly-device-id",
-                manufacturer="Shelly",
-                model="Plug S",
-            ),
-        },
-    )
-
-    mock_registry(
-        hass,
-        {
-            "sensor.existing_power": RegistryEntryWithDefaults(
-                entity_id="sensor.existing_power",
-                unique_id="1234",
-                platform="sensor",
-                device_id="shelly-device-id",
-                device_class=SensorDeviceClass.POWER,
-            ),
-            "sensor.existing_energy": RegistryEntryWithDefaults(
-                entity_id="sensor.existing_energy",
-                unique_id="12345",
-                platform="sensor",
-                device_id="shelly-device-id",
-                device_class=SensorDeviceClass.ENERGY,
-            ),
+            "sensor.existing_power": {"device_id": "shelly-device-id", "device_class": SensorDeviceClass.POWER},
+            "sensor.existing_energy": {"device_id": "shelly-device-id", "device_class": SensorDeviceClass.ENERGY},
         },
     )
 
@@ -176,17 +138,25 @@ async def test_force_create_energy_sensor_for_existing_power_sensor(
         },
     )
 
-    power_state = hass.states.get("sensor.testgroup_power")
-    assert power_state
-    assert power_state.attributes.get(ATTR_ENTITIES) == {
-        "sensor.existing_power",
-    }
+    assert_entity_state(
+        hass,
+        "sensor.testgroup_power",
+        attributes={
+            ATTR_ENTITIES: {
+                "sensor.existing_power",
+            },
+        },
+    )
 
-    energy_state = hass.states.get("sensor.testgroup_energy")
-    assert energy_state
-    assert energy_state.attributes.get(ATTR_ENTITIES) == {
-        "sensor.mysensor_energy",
-    }
+    assert_entity_state(
+        hass,
+        "sensor.testgroup_energy",
+        attributes={
+            ATTR_ENTITIES: {
+                "sensor.mysensor_energy",
+            },
+        },
+    )
 
 
 async def test_force_create_energy_sensor_overrides_create_energy_sensors_option(hass: HomeAssistant) -> None:
@@ -194,15 +164,10 @@ async def test_force_create_energy_sensor_overrides_create_energy_sensors_option
     When you use force_energy_sensor_creation, it should override create_energy_sensors option,
     and create an energy sensor
     """
-    mock_registry(
+    mock_entities_in_registry(
         hass,
         {
-            "sensor.existing_power": RegistryEntryWithDefaults(
-                entity_id="sensor.bedroom_airco_power",
-                unique_id="1234",
-                platform="sensor",
-                device_class=SensorDeviceClass.POWER,
-            ),
+            "sensor.bedroom_airco_power": {"device_class": SensorDeviceClass.POWER},
         },
     )
 
@@ -224,7 +189,6 @@ async def test_force_create_energy_sensor_overrides_create_energy_sensors_option
 
 
 async def test_disable_extended_attributes(hass: HomeAssistant) -> None:
-    await create_input_boolean(hass)
 
     await run_powercalc_setup(
         hass,
@@ -237,8 +201,10 @@ async def test_disable_extended_attributes(hass: HomeAssistant) -> None:
     assert ATTR_SOURCE_ENTITY not in energy_state.attributes
 
 
-async def test_rounding_precision(hass: HomeAssistant, entity_registry: EntityRegistry) -> None:
-    await create_input_boolean(hass)
+async def test_rounding_precision(hass: HomeAssistant) -> None:
+    # The source entity needs a unique id, otherwise the energy sensor is not registered.
+    entity_registry = mock_entities_in_registry(hass, {"input_boolean.test": {}})
+    await set_states(hass, [("input_boolean.test", STATE_OFF)])
 
     await run_powercalc_setup(
         hass,
@@ -272,11 +238,15 @@ async def test_real_energy_sensor(hass: HomeAssistant) -> None:
     )
 
     await hass.async_block_till_done()
-    energy_state = hass.states.get("sensor.testgroup_energy")
-    assert energy_state
-    assert energy_state.attributes.get(ATTR_ENTITIES) == {
-        "sensor.existing_energy",
-    }
+    assert_entity_state(
+        hass,
+        "sensor.testgroup_energy",
+        attributes={
+            ATTR_ENTITIES: {
+                "sensor.existing_energy",
+            },
+        },
+    )
 
 
 async def test_real_energy_sensor_error_on_non_existing_entity(
@@ -304,45 +274,28 @@ async def test_real_energy_sensor_error_on_non_existing_entity(
     assert "No energy sensor with id" in caplog.text
 
 
-async def test_unit_prefix_none(hass: HomeAssistant) -> None:
-    await create_input_boolean(hass)
-
+@pytest.mark.parametrize(
+    "domain_config, expected_unit",
+    [
+        pytest.param({CONF_ENERGY_SENSOR_UNIT_PREFIX: UnitPrefix.NONE}, UnitOfEnergy.WATT_HOUR, id="none"),
+        # Without an explicit prefix it defaults to k, so a W power sensor yields a kWh energy sensor.
+        pytest.param({}, UnitOfEnergy.KILO_WATT_HOUR, id="kilo by default"),
+    ],
+)
+async def test_unit_prefix(hass: HomeAssistant, domain_config: ConfigType, expected_unit: str) -> None:
     await run_powercalc_setup(
         hass,
         get_simple_fixed_config("input_boolean.test"),
-        {CONF_ENERGY_SENSOR_UNIT_PREFIX: UnitPrefix.NONE},
+        domain_config,
     )
 
-    async_fire_time_changed(
-        hass,
-        dt.utcnow() + timedelta(hours=1),
-    )
+    await async_advance_time(hass, timedelta(hours=1), block=False)
 
     await set_states(hass, [("sensor.test_power", "50.00", {ATTR_UNIT_OF_MEASUREMENT: "W"})])
-    state_attributes = hass.states.get("sensor.test_energy").attributes
-    assert state_attributes.get("unit_of_measurement") == UnitOfEnergy.WATT_HOUR
+    assert_entity_state(hass, "sensor.test_energy", attributes={ATTR_UNIT_OF_MEASUREMENT: expected_unit})
 
 
-async def test_unit_prefix_kwh_default(hass: HomeAssistant) -> None:
-    """By default, unit prefix should be k, resulting in kWh energy sensor created for a W power sensor"""
-    await create_input_boolean(hass)
-
-    await run_powercalc_setup(
-        hass,
-        get_simple_fixed_config("input_boolean.test"),
-    )
-
-    async_fire_time_changed(
-        hass,
-        dt.utcnow() + timedelta(hours=1),
-    )
-
-    await set_states(hass, [("sensor.test_power", "50.00", {ATTR_UNIT_OF_MEASUREMENT: "W"})])
-    state_attributes = hass.states.get("sensor.test_energy").attributes
-    assert state_attributes.get("unit_of_measurement") == UnitOfEnergy.KILO_WATT_HOUR
-
-
-async def test_set_entity_category(hass: HomeAssistant) -> None:
+def test_set_entity_category(hass: HomeAssistant) -> None:
     energy_sensor = VirtualEnergySensor(
         hass=hass,
         source_entity="sensor.test_power",
@@ -354,13 +307,12 @@ async def test_set_entity_category(hass: HomeAssistant) -> None:
         powercalc_source_entity="light.test",
         powercalc_source_domain="light",
         sensor_config={},
-        device_info=None,
     )
     assert energy_sensor.entity_category == EntityCategory.DIAGNOSTIC
 
 
 async def test_calibrate_service(hass: HomeAssistant) -> None:
-    await create_input_boolean(hass)
+    await set_states(hass, [("input_boolean.test", STATE_OFF)])
 
     await run_powercalc_setup(
         hass,
@@ -387,16 +339,13 @@ async def test_real_power_sensor_kw(hass: HomeAssistant) -> None:
     Fixes https://github.com/bramstroker/homeassistant-powercalc/issues/1676
     """
 
-    mock_registry(
+    mock_entities_in_registry(
         hass,
         {
-            "sensor.test_power": RegistryEntryWithDefaults(
-                entity_id="sensor.test_power",
-                unique_id="12345",
-                platform="sensor",
-                device_class=SensorDeviceClass.POWER,
-                unit_of_measurement=UnitOfPower.KILO_WATT,
-            ),
+            "sensor.test_power": {
+                "device_class": SensorDeviceClass.POWER,
+                "unit_of_measurement": UnitOfPower.KILO_WATT,
+            },
         },
     )
 
@@ -442,9 +391,29 @@ async def test_real_power_sensor_kw(hass: HomeAssistant) -> None:
                 ),
             ],
         )
+    assert_entity_state(hass, "sensor.test_energy", attributes={ATTR_UNIT_OF_MEASUREMENT: UnitOfEnergy.KILO_WATT_HOUR})
+
+
+async def test_real_power_sensor_invalid_unit(hass: HomeAssistant) -> None:
+    """Test that an invalid unit on the source power sensor falls back gracefully."""
+    mock_entities_in_registry(
+        hass,
+        {
+            "sensor.test_power": {"device_class": SensorDeviceClass.POWER, "unit_of_measurement": "bogus_unit"},
+        },
+    )
+
+    await run_powercalc_setup(
+        hass,
+        {
+            CONF_NAME: "Test",
+            CONF_UNIQUE_ID: "1234353",
+            CONF_POWER_SENSOR_ID: "sensor.test_power",
+        },
+    )
+
     state = hass.states.get("sensor.test_energy")
     assert state
-    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == UnitOfEnergy.KILO_WATT_HOUR
 
 
 async def test_device_class_is_set_after_startup(hass: HomeAssistant) -> None:
@@ -458,9 +427,7 @@ async def test_device_class_is_set_after_startup(hass: HomeAssistant) -> None:
         },
     )
 
-    state = hass.states.get("sensor.test_energy")
-    assert state
-    assert state.attributes.get(ATTR_DEVICE_CLASS) == SensorDeviceClass.ENERGY
+    assert_entity_state(hass, "sensor.test_energy", attributes={ATTR_DEVICE_CLASS: SensorDeviceClass.ENERGY})
 
 
 async def test_force_updated_at_interval(hass: HomeAssistant) -> None:
@@ -484,9 +451,9 @@ async def test_force_updated_at_interval(hass: HomeAssistant) -> None:
     energy_sensor_id = "sensor.test_energy"
 
     await set_states(hass, [(power_sensor_id, "100", {ATTR_UNIT_OF_MEASUREMENT: "W"})])
-    async_fire_time_changed(hass, dt.utcnow() + timedelta(minutes=60))
+    await async_advance_time(hass, timedelta(minutes=60), block=False)
     assert_entity_state(hass, energy_sensor_id, "0.1000")
-    async_fire_time_changed(hass, dt.utcnow() + timedelta(seconds=40))
+    await async_advance_time(hass, 40, block=False)
     assert_entity_state(hass, energy_sensor_id, "0.1011")
 
 
@@ -520,3 +487,92 @@ async def test_outlier_filtering(hass: HomeAssistant, caplog: pytest.LogCaptureF
         ],
     )
     assert "Rejecting power value 7000000 as outlier for energy integration" in caplog.text
+
+
+@pytest.mark.parametrize("interruption", [STATE_UNAVAILABLE, STATE_UNKNOWN, "foo"])
+async def test_outlier_filtering_handles_non_numeric_states(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+    freezer: FrozenDateTimeFactory,
+    interruption: str,
+) -> None:
+    """A non numeric power state must pass through the outlier filter untouched.
+
+    It also must not clear the pending rejection: when the source recovers, the substitution
+    of the previously rejected outlier still has to happen.
+    """
+    caplog.set_level(logging.DEBUG)
+
+    power_sensor_id = "sensor.test_power"
+    await run_powercalc_setup(
+        hass,
+        {
+            CONF_NAME: "Test",
+            CONF_POWER_SENSOR_ID: power_sensor_id,
+            CONF_ENERGY_FILTER_OUTLIER_ENABLED: True,
+        },
+    )
+
+    async def advance_and_set(value: str) -> None:
+        freezer.tick(timedelta(seconds=15))
+        await set_states(hass, [(power_sensor_id, value, {ATTR_UNIT_OF_MEASUREMENT: "W"})])
+
+    for value in ["4.4", "4.1", "4.6", "4.2", "4.5", "4.4", "4.5", "4.1", "4.0", "4.2"]:
+        await advance_and_set(value)
+
+    energy_before = float(hass.states.get("sensor.test_energy").state)
+
+    # Spike, then the source drops out before returning to the baseline
+    await advance_and_set("6553.5")
+    await advance_and_set(interruption)
+    await advance_and_set("4.0")
+
+    energy_after = float(hass.states.get("sensor.test_energy").state)
+
+    assert "Rejecting power value 6553.5 as outlier for energy integration" in caplog.text
+    assert energy_after - energy_before < 0.001
+
+
+async def test_outlier_filtering_does_not_leak_energy(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Regression test for https://github.com/bramstroker/homeassistant-powercalc/issues/4279.
+
+    With the default `left` Riemann integration method the harmful contribution of an outlier
+    is not on its own state change (it becomes the new_state), but on the *following* state
+    change when it acts as the old_state. Ensure the spike never leaks into the energy total.
+    """
+    caplog.set_level(logging.DEBUG)
+
+    power_sensor_id = "sensor.test_power"
+    await run_powercalc_setup(
+        hass,
+        {
+            CONF_NAME: "Test",
+            CONF_POWER_SENSOR_ID: power_sensor_id,
+            CONF_ENERGY_FILTER_OUTLIER_ENABLED: True,
+        },
+    )
+
+    async def advance_and_set(value: str) -> None:
+        freezer.tick(timedelta(seconds=15))
+        await set_states(hass, [(power_sensor_id, value, {ATTR_UNIT_OF_MEASUREMENT: "W"})])
+
+    # Warm up the filter with a stable but slightly varied ~4W baseline (non-zero MAD)
+    for value in ["4.4", "4.1", "4.6", "4.2", "4.5", "4.4", "4.5", "4.1", "4.0", "4.2"]:
+        await advance_and_set(value)
+
+    energy_before = float(hass.states.get("sensor.test_energy").state)
+
+    # Spike to an unrealistic value and back to the baseline
+    await advance_and_set("6553.5")
+    await advance_and_set("4.0")
+
+    energy_after = float(hass.states.get("sensor.test_energy").state)
+
+    assert "Rejecting power value 6553.5 as outlier for energy integration" in caplog.text
+    # The spike (6553.5W integrated over 15s ~= 0.027 kWh) must not have leaked into the total.
+    # Only the ~4W baseline over the two intervals (~0.00003 kWh) may have accrued.
+    assert energy_after - energy_before < 0.001

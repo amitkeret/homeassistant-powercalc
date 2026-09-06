@@ -1,5 +1,3 @@
-from datetime import timedelta
-
 from homeassistant.components.light import ATTR_BRIGHTNESS, ATTR_COLOR_MODE, ATTR_EFFECT, ColorMode
 from homeassistant.const import (
     CONF_CONDITION,
@@ -13,9 +11,6 @@ from homeassistant.const import (
     STATE_UNAVAILABLE,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.device_registry import DeviceEntry
-from homeassistant.util import dt
-from pytest_homeassistant_custom_component.common import RegistryEntryWithDefaults, async_fire_time_changed, mock_device_registry, mock_registry
 
 from custom_components.powercalc.const import (
     CONF_COMPOSITE,
@@ -38,35 +33,16 @@ from custom_components.powercalc.const import (
 from custom_components.powercalc.strategy.composite import CompositeMode
 from tests.common import (
     assert_entity_state,
+    async_advance_time,
     get_test_profile_dir,
+    mock_device_with_entities,
     run_powercalc_setup,
     set_states,
 )
 
 
 async def test_composite(hass: HomeAssistant) -> None:
-    mock_device_registry(
-        hass,
-        {
-            "my-device-id": DeviceEntry(
-                id="my-device-id",
-                manufacturer="foo",
-                model="bar",
-            ),
-        },
-    )
-
-    mock_registry(
-        hass,
-        {
-            "light.test": RegistryEntryWithDefaults(
-                entity_id="light.test",
-                unique_id="1234",
-                platform="light",
-                device_id="my-device-id",
-            ),
-        },
-    )
+    mock_device_with_entities(hass, "light.test", "foo", "bar")
 
     sensor_config = {
         CONF_ENTITY_ID: "light.test",
@@ -216,10 +192,16 @@ async def test_nested_conditions(hass: HomeAssistant) -> None:
     )
     assert_entity_state(hass, "sensor.test_power", "10.00")
 
-    await set_states(hass, [("binary_sensor.test1", STATE_OFF), ("binary_sensor.test2", STATE_OFF), ("binary_sensor.test3", STATE_ON)])
+    await set_states(
+        hass,
+        [("binary_sensor.test1", STATE_OFF), ("binary_sensor.test2", STATE_OFF), ("binary_sensor.test3", STATE_ON)],
+    )
     assert_entity_state(hass, "sensor.test_power", "10.00")
 
-    await set_states(hass, [("binary_sensor.test1", STATE_ON), ("binary_sensor.test2", STATE_OFF), ("binary_sensor.test3", STATE_ON)])
+    await set_states(
+        hass,
+        [("binary_sensor.test1", STATE_ON), ("binary_sensor.test2", STATE_OFF), ("binary_sensor.test3", STATE_ON)],
+    )
     assert_entity_state(hass, "sensor.test_power", STATE_UNAVAILABLE)
 
 
@@ -270,11 +252,11 @@ async def test_playbook(hass: HomeAssistant) -> None:
     assert_entity_state(hass, "sensor.dishwasher_power", "1.60")
 
     await set_states(hass, [(dishwasher_mode_entity, "Cycle Active")])
-    async_fire_time_changed(hass, dt.utcnow() + timedelta(seconds=3))
+    await async_advance_time(hass, 3, block=False)
 
     assert_entity_state(hass, "sensor.dishwasher_power", "20.00")
 
-    async_fire_time_changed(hass, dt.utcnow() + timedelta(seconds=5))
+    await async_advance_time(hass, 5, block=False)
 
     assert_entity_state(hass, "sensor.dishwasher_power", "40.00")
 
@@ -285,7 +267,8 @@ async def test_playbook(hass: HomeAssistant) -> None:
     assert_entity_state(hass, "sensor.dishwasher_power", "0.00")
 
 
-async def test_calculate_standby_power(hass: HomeAssistant) -> None:
+async def test_standby_power_is_ignored_when_strategy_handles_off_state(hass: HomeAssistant) -> None:
+    """Multi switch resolves the off state itself, so the configured standby power must not take over."""
     sensor_config = {
         CONF_ENTITY_ID: "switch.test",
         CONF_STANDBY_POWER: 1,
@@ -322,7 +305,8 @@ async def test_calculate_standby_power(hass: HomeAssistant) -> None:
     assert_entity_state(hass, "sensor.test_power", "10.00")
 
 
-async def test_calculate_standby_power2(hass: HomeAssistant) -> None:
+async def test_standby_power_is_used_when_strategy_cannot_handle_off_state(hass: HomeAssistant) -> None:
+    """Fixed cannot resolve the off state, so the configured standby power applies instead."""
     sensor_config = {
         CONF_ENTITY_ID: "switch.test",
         CONF_STANDBY_POWER: 1,
@@ -367,6 +351,75 @@ async def test_composite_strategy_from_library_profile(hass: HomeAssistant) -> N
 
     await set_states(hass, [("light.test", STATE_ON, {ATTR_BRIGHTNESS: 200})])
     assert_entity_state(hass, "sensor.test_power", "0.82")
+
+
+async def test_nested_conditions_from_library_profile(hass: HomeAssistant) -> None:
+    """Nested conditions in a library profile must be normalized the same way YAML configuration is.
+
+    A scalar entity_id was iterated character by character, making every condition raise,
+    and a nested condition omitting entity_id did not default to the source entity.
+    See https://github.com/bramstroker/homeassistant-powercalc/issues/4378
+    """
+    await run_powercalc_setup(
+        hass,
+        {
+            CONF_ENTITY_ID: "fan.test",
+            CONF_CUSTOM_MODEL_DIRECTORY: get_test_profile_dir("composite_nested"),
+        },
+    )
+
+    await set_states(hass, [("fan.test", STATE_ON, {"oscillating": True, "direction": "reverse"})])
+    assert_entity_state(hass, "sensor.test_power", "20.00")
+
+    await set_states(hass, [("fan.test", STATE_ON, {"oscillating": True, "direction": "forward"})])
+    assert_entity_state(hass, "sensor.test_power", "15.00")
+
+    await set_states(hass, [("fan.test", STATE_ON, {"oscillating": False, "direction": "forward"})])
+    assert_entity_state(hass, "sensor.test_power", "5.00")
+
+
+async def test_nested_condition_omit_entity_id(hass: HomeAssistant) -> None:
+    await set_states(hass, [("media_player.test", STATE_PAUSED, {"source": "HDMI1"})])
+    sensor_config = {
+        CONF_ENTITY_ID: "media_player.test",
+        CONF_COMPOSITE: [
+            {
+                CONF_CONDITION: {
+                    "condition": "and",
+                    "conditions": [
+                        {"condition": "state", "state": STATE_PLAYING},
+                        {"condition": "state", "attribute": "source", "state": "HDMI1"},
+                    ],
+                },
+                CONF_FIXED: {CONF_POWER: 20},
+            },
+            {
+                CONF_FIXED: {CONF_POWER: 2},
+            },
+        ],
+    }
+
+    await run_powercalc_setup(hass, sensor_config, {})
+
+    assert_entity_state(hass, "sensor.test_power", "2.00")
+
+    await set_states(hass, [("media_player.test", STATE_PLAYING, {"source": "HDMI1"})])
+    assert_entity_state(hass, "sensor.test_power", "20.00")
+
+    await set_states(hass, [("media_player.test", STATE_PLAYING, {"source": "HDMI2"})])
+    assert_entity_state(hass, "sensor.test_power", "2.00")
+
+
+async def test_invalid_composite_config_in_profile(hass: HomeAssistant) -> None:
+    await run_powercalc_setup(
+        hass,
+        {
+            CONF_ENTITY_ID: "light.test",
+            CONF_CUSTOM_MODEL_DIRECTORY: get_test_profile_dir("composite_invalid"),
+        },
+    )
+
+    assert not hass.states.get("sensor.test_power")
 
 
 async def test_composite_mode_sum(hass: HomeAssistant) -> None:
@@ -516,7 +569,10 @@ async def test_state_attribute_entity_id(hass: HomeAssistant) -> None:
 async def test_lut(hass: HomeAssistant) -> None:
     light_entity = "light.test"
     power_entity = "sensor.test_power"
-    await run_powercalc_setup(hass, {CONF_ENTITY_ID: light_entity, CONF_MANUFACTURER: "test", CONF_MODEL: "composite_lut"})
+    await run_powercalc_setup(
+        hass,
+        {CONF_ENTITY_ID: light_entity, CONF_MANUFACTURER: "test", CONF_MODEL: "composite_lut"},
+    )
 
     assert hass.states.get(power_entity)
 
